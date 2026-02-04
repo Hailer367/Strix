@@ -182,15 +182,22 @@ jobs:
       - name: Install Discord Bot Dependencies
         run: |
           echo "::group::Installing Discord Bot Dependencies"
-          pip install discord.py aiohttp
+          pip install discord.py aiohttp jinja2 litellm pydantic rich httpx tenacity
           echo "::endgroup::"
 
-      - name: Copy Discord Bot Script
+      - name: Copy Discord Bot and Strix Files
         run: |
           cp discord_bot.py /tmp/discord_bot.py
+          # Copy the entire strix package for the agent
+          cp -r strix /tmp/strix
 
       - name: Run Discord Bot
         timeout-minutes: 360
+        env:
+          TOOL_SERVER_PORT: "48081"
+          TOOL_SERVER_TOKEN: "discord-bot-token"
+          STRIX_DIRECT_API_MODE: "true"
+          PYTHONPATH: "/tmp"
         run: |
           echo "╔══════════════════════════════════════════════════════════════╗"
           echo "║         STRIX DISCORD INTEGRATION ACTIVATED                  ║"
@@ -202,7 +209,7 @@ jobs:
           echo "║  Discord Integration: ACTIVE                                ║"
           echo "║                                                              ║"
           echo "║  Discord bot is now running and awaiting commands...         ║"
-          echo "║  Use !scan <target> to initiate security scans               ║"
+          echo "║  Use @Strix <message> to interact with the agent             ║"
           echo "╚══════════════════════════════════════════════════════════════╝"
 
           # Pass the accounts count to the bot

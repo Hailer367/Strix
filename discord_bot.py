@@ -1,725 +1,733 @@
 #!/usr/bin/env python3
+"""
+Strix Discord Bot - A Discord integration for the Strix AI Security Agent.
+
+This bot provides a Discord interface to interact with the full Strix agent,
+giving users access to all of Strix's capabilities including:
+- Terminal command execution
+- Python code execution
+- Browser automation
+- File operations
+- Web searching
+- Security scanning tools
+- And all other Strix tools
+
+The bot maintains conversation history and can execute long-running tasks
+asynchronously, notifying users when tasks are complete.
+"""
+
 import asyncio
 import discord
 from discord.ext import commands
 import os
-import subprocess
 import json
-import tempfile
-import threading
+import re
 import time
-import aiohttp
+import logging
 from datetime import datetime
+from typing import Any, Optional
+import aiohttp
+from dataclasses import dataclass, field
 
-# Initialize bot
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True  # Required to mention members
-intents.reactions = True  # Required for reactions
-intents.guilds = True  # Required to access guild info
-bot = commands.Bot(command_prefix='!', intents=intents)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)-8s] %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger('strix.discord')
 
-# Global variables to maintain Strix context
-current_job_id = None
-job_results = {}
-active_scans = {}  # Track active scans with user info
+# ============================================================================
+# STRIX SYSTEM PROMPT - This defines who Strix is and what it can do
+# ============================================================================
 
-# Conversation memory system
-conversation_memory = {}  # Stores conversation history per user/channel
-MAX_MEMORY_ENTRIES = 10  # Maximum number of conversation entries to keep
+STRIX_SYSTEM_PROMPT = """You are Strix, an advanced AI cybersecurity agent developed by OmniSecure Labs. You are currently operating through a Discord bot interface, which allows users to interact with you conversationally.
 
-# API readiness check
-api_ready = False
+<identity>
+- You are Strix, an autonomous AI security agent
+- You have FULL ACCESS to your execution environment
+- You can execute terminal commands, run Python scripts, browse the web, edit files, and use all security tools
+- You are running inside a GitHub Actions environment with access to security tools
+</identity>
 
-def get_chat_completions_url(base_endpoint: str) -> str:
-    """Construct the correct chat completions URL from the base endpoint.
+<capabilities>
+You have access to the following capabilities through your environment:
+
+TERMINAL & SHELL:
+- Execute any bash/shell commands
+- Run security tools like nmap, nuclei, nikto, sqlmap, ffuf, etc.
+- Install additional packages as needed
+
+PYTHON EXECUTION:
+- Write and execute Python scripts
+- Use libraries like requests, aiohttp, beautifulsoup4, etc.
+- Automate complex tasks with scripts
+
+SECURITY TOOLS AVAILABLE:
+- Network scanning: nmap, ncat, masscan
+- Vulnerability scanning: nuclei, nikto, wapiti
+- Web fuzzing: ffuf, dirsearch, gobuster
+- SQL injection: sqlmap
+- Subdomain enumeration: subfinder, amass
+- Web crawling: katana, gospider, httpx
+- Secret detection: trufflehog, gitleaks
+- Static analysis: semgrep, bandit
+- And many more...
+
+FILE OPERATIONS:
+- Read, write, and edit files
+- Navigate the filesystem
+- Process and analyze data
+
+WEB BROWSING:
+- Browse websites
+- Take screenshots
+- Interact with web applications
+</capabilities>
+
+<communication_style>
+When responding to users on Discord:
+- Be helpful, direct, and actionable
+- When asked to perform tasks, DO them - don't just explain how
+- Show your work by sharing command outputs and results
+- Break down complex tasks into steps
+- Keep responses concise but informative
+- Use markdown formatting for code blocks and emphasis
+- If a task will take time, let the user know you're working on it
+</communication_style>
+
+<behavioral_rules>
+1. ALWAYS EXECUTE TASKS: When users ask you to scan, test, or analyze something, actually do it
+2. SHOW RESULTS: Share the actual outputs, findings, and results
+3. BE PROACTIVE: If you find issues, report them with details
+4. STAY FOCUSED: Complete the task at hand before moving to new topics
+5. BE HONEST: If you can't do something, explain why and suggest alternatives
+6. WORK AUTONOMOUSLY: Don't ask for permission for every step - proceed with the task
+7. RESPECT SCOPE: Only scan/test targets the user specifies
+</behavioral_rules>
+
+<response_format>
+For task execution:
+1. Acknowledge what you'll do
+2. Execute the necessary commands/scripts
+3. Share the results with relevant details
+4. Provide analysis or recommendations if applicable
+
+For questions:
+- Provide clear, accurate answers
+- Include examples when helpful
+- Reference your available tools when relevant
+</response_format>
+
+Remember: You ARE Strix. You HAVE these capabilities. You CAN execute commands and tools. When users ask you to do something, DO IT - don't tell them you can't or that you're "just an AI". You are an AI agent with full execution capabilities.
+"""
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+@dataclass
+class BotConfig:
+    """Bot configuration settings."""
+    discord_token: str = ""
+    discord_channel_id: Optional[int] = None
+    cliproxy_endpoint: str = ""
+    cliproxy_model: str = ""
+    openai_api_key: str = ""
+    accounts_count: int = 0
+    max_message_length: int = 1900
+    max_memory_entries: int = 20
+    typing_indicator: bool = True
     
-    The CLIPROXY_ENDPOINT is set to something like 'http://127.0.0.1:8317/v1'
-    For chat completions, we need to POST to 'http://127.0.0.1:8317/v1/chat/completions'
-    """
-    # Remove trailing slash if present
-    base = base_endpoint.rstrip('/')
+    @classmethod
+    def from_env(cls) -> "BotConfig":
+        """Load configuration from environment variables."""
+        config = cls()
+        config.discord_token = os.getenv('DISCORD_BOT_TOKEN', '')
+        channel_id = os.getenv('DISCORD_CHANNEL_ID', '')
+        config.discord_channel_id = int(channel_id) if channel_id else None
+        config.cliproxy_endpoint = os.getenv('CLIPROXY_ENDPOINT', '')
+        config.cliproxy_model = os.getenv('CLIPROXY_MODEL', 'qwen3-coder-plus')
+        config.openai_api_key = os.getenv('OPENAI_API_KEY', 'cliproxy-direct-mode')
+        config.accounts_count = int(os.getenv('ACCOUNTS_COUNT', '0'))
+        return config
+
+
+# ============================================================================
+# Conversation Memory
+# ============================================================================
+
+@dataclass
+class ConversationEntry:
+    """A single conversation entry."""
+    role: str  # 'user' or 'assistant'
+    content: str
+    timestamp: datetime = field(default_factory=datetime.now)
+    username: Optional[str] = None
+
+
+class ConversationMemory:
+    """Manages conversation history for users/channels."""
     
-    # Check if endpoint already ends with /chat/completions
-    if base.endswith('/chat/completions'):
-        return base
+    def __init__(self, max_entries: int = 20):
+        self.max_entries = max_entries
+        self._memory: dict[str, list[ConversationEntry]] = {}
     
-    # Check if endpoint ends with /v1, append /chat/completions
-    if base.endswith('/v1'):
-        return f"{base}/chat/completions"
+    def _get_key(self, user_id: int, channel_id: int) -> str:
+        return f"{user_id}_{channel_id}"
     
-    # Otherwise, assume it's a base URL and add /v1/chat/completions
-    return f"{base}/v1/chat/completions"
-
-@bot.event
-async def on_ready():
-    print(f'Discord bot is ready. Logged in as {bot.user}')
-    channel_id_str = os.getenv('DISCORD_CHANNEL_ID', '')
-    if channel_id_str:
-        try:
-            channel_id = int(channel_id_str)
-            channel = bot.get_channel(channel_id)
-            if channel:
-                await channel.send(f"✅ Strix Security Agent is online and ready!\nModel: {os.getenv('CLIPROXY_MODEL', 'unknown')}\nAccounts: {os.getenv('ACCOUNTS_COUNT', '0')}")
-        except ValueError:
-            print(f"Invalid channel ID: {channel_id_str}")
-    else:
-        print("DISCORD_CHANNEL_ID not set, skipping startup message")
-
-@bot.event
-async def on_message(message):
-    # Ignore messages from the bot itself
-    if message.author == bot.user:
-        return
-
-    # Check if the bot is mentioned in the message
-    if bot.user in message.mentions:
-        # Remove the mention from the message content to get the actual query
-        content = message.content.replace(f'<@{bot.user.id}>', '').replace(f'<@!{bot.user.id}>', '').strip()
-
-        if content.lower().startswith('scan'):
-            # Extract target from the message
-            target_parts = content.split(' ', 1)
-            if len(target_parts) > 1:
-                target = target_parts[1].strip()
-                await handle_scan_request(message, target)
-            else:
-                await message.channel.send("❌ Please specify a target to scan. Usage: `@Strix scan <target>`")
-        elif content:
-            # Treat as a general query to the Strix agent
-            await handle_general_query(message, content)
-        else:
-            # Just mentioned the bot without a command
-            await message.channel.send(f"👋 Hello! I'm the Strix Security Agent. You can ask me to scan targets or ask security-related questions.")
-
-    # Process commands as well
-    await bot.process_commands(message)
-
-async def handle_scan_request(message, target):
-    """Handle a scan request from a mention"""
-    # Validate target format to prevent command injection
-    if not validate_target(target):
-        await message.channel.send("❌ Invalid target format. Only domains, IPs, and URLs are allowed.")
-        return
-
-    # Create a new job
-    job_id = f"job_{int(time.time())}"
-    global current_job_id
-    current_job_id = job_id
-
-    # Track the active scan with user info
-    active_scans[job_id] = {
-        'user_id': message.author.id,
-        'channel_id': message.channel.id,
-        'target': target,
-        'start_time': datetime.now()
-    }
-
-    # Send initial message
-    msg = await message.channel.send(f"🔍 Starting security scan on `{target}` (Job ID: {job_id})...")
-
-    # Run the scan in a separate thread to not block the bot
-    def run_scan():
-        try:
-            # Create a temporary directory for scan results
-            with tempfile.TemporaryDirectory() as temp_dir:
-                # Determine which scanning tool to use based on target type
-                if target.startswith(('http://', 'https://')):
-                    # Use a DAST tool like nikto or nmap for web apps
-                    cmd = [
-                        'docker', 'run', '--rm',
-                        '-v', f'{temp_dir}:/results',
-                        '-e', f'TARGET={target}',
-                        '-e', 'CLIPROXY_ENDPOINT=' + os.getenv('CLIPROXY_ENDPOINT'),
-                        '-e', 'CLIPROXY_MODEL=' + os.getenv('CLIPROXY_MODEL'),
-                        os.getenv('STRIX_IMAGE'),
-                        'nuclei', '-u', target, '-o', f'/results/{job_id}_nuclei_results.txt'
-                    ]
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)  # 30 minute timeout
-
-                    # Also run additional scans
-                    subprocess.run([
-                        'docker', 'run', '--rm',
-                        '-v', f'{temp_dir}:/results',
-                        os.getenv('STRIX_IMAGE'),
-                        'nmap', '-sV', target, '-oN', f'/results/{job_id}_nmap_results.txt'
-                    ], timeout=1800)
-
-                else:
-                    # Use SAST tools for code repositories
-                    cmd = [
-                        'docker', 'run', '--rm',
-                        '-v', f'{temp_dir}:/results',
-                        '-e', 'CLIPROXY_ENDPOINT=' + os.getenv('CLIPROXY_ENDPOINT'),
-                        '-e', 'CLIPROXY_MODEL=' + os.getenv('CLIPROXY_MODEL'),
-                        os.getenv('STRIX_IMAGE'),
-                        'semgrep', '--config=auto', target, '--json', f'-o', f'/results/{job_id}_semgrep_results.json'
-                    ]
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-
-                # Read results
-                results = {}
-                for filename in os.listdir(temp_dir):
-                    filepath = os.path.join(temp_dir, filename)
-                    with open(filepath, 'r') as f:
-                        results[filename] = f.read()
-
-                # Store results
-                job_results[job_id] = {
-                    'target': target,
-                    'timestamp': datetime.now().isoformat(),
-                    'results': results,
-                    'status': 'completed'
-                }
-
-                # Send results to Discord
-                asyncio.run_coroutine_threadsafe(send_results_to_discord_with_notification(job_id), bot.loop)
-
-        except subprocess.TimeoutExpired:
-            job_results[job_id] = {
-                'target': target,
-                'timestamp': datetime.now().isoformat(),
-                'results': {'error': 'Scan timed out after 30 minutes'},
-                'status': 'timeout'
-            }
-            asyncio.run_coroutine_threadsafe(send_timeout_notification(job_id), bot.loop)
-        except Exception as e:
-            job_results[job_id] = {
-                'target': target,
-                'timestamp': datetime.now().isoformat(),
-                'results': {'error': str(e)},
-                'status': 'error'
-            }
-            asyncio.run_coroutine_threadsafe(send_error_notification(job_id, str(e)), bot.loop)
-
-    # Run the scan in a separate thread
-    scan_thread = threading.Thread(target=run_scan)
-    scan_thread.start()
-
-def get_conversation_key(user_id, channel_id):
-    """Generate a unique key for conversation memory"""
-    return f"{user_id}_{channel_id}"
-
-def add_to_conversation_memory(user_id, channel_id, user_message, ai_response):
-    """Add a message exchange to the conversation memory"""
-    key = get_conversation_key(user_id, channel_id)
-
-    if key not in conversation_memory:
-        conversation_memory[key] = []
-
-    # Add the new exchange to memory
-    conversation_memory[key].append({
-        'user': user_message,
-        'ai': ai_response,
-        'timestamp': datetime.now().isoformat()
-    })
-
-    # Keep only the most recent entries
-    if len(conversation_memory[key]) > MAX_MEMORY_ENTRIES:
-        conversation_memory[key] = conversation_memory[key][-MAX_MEMORY_ENTRIES:]
-
-def get_conversation_context(user_id, channel_id):
-    """Retrieve the conversation context for a user in a channel"""
-    key = get_conversation_key(user_id, channel_id)
-
-    if key not in conversation_memory:
-        return []
-
-    return conversation_memory[key]
-
-async def check_api_readiness():
-    """Check if the API is ready to accept requests"""
-    global api_ready
-    endpoint = os.getenv('CLIPROXY_ENDPOINT')
-
-    if not endpoint:
-        print("CLIPROXY_ENDPOINT not set")
+    def add_message(
+        self, 
+        user_id: int, 
+        channel_id: int, 
+        role: str, 
+        content: str,
+        username: Optional[str] = None
+    ) -> None:
+        """Add a message to conversation history."""
+        key = self._get_key(user_id, channel_id)
+        if key not in self._memory:
+            self._memory[key] = []
+        
+        self._memory[key].append(ConversationEntry(
+            role=role,
+            content=content,
+            username=username
+        ))
+        
+        # Trim to max entries
+        if len(self._memory[key]) > self.max_entries:
+            self._memory[key] = self._memory[key][-self.max_entries:]
+    
+    def get_history(self, user_id: int, channel_id: int) -> list[dict[str, str]]:
+        """Get conversation history as list of message dicts."""
+        key = self._get_key(user_id, channel_id)
+        if key not in self._memory:
+            return []
+        
+        return [
+            {"role": entry.role, "content": entry.content}
+            for entry in self._memory[key]
+        ]
+    
+    def clear(self, user_id: int, channel_id: int) -> bool:
+        """Clear conversation history for a user/channel."""
+        key = self._get_key(user_id, channel_id)
+        if key in self._memory:
+            del self._memory[key]
+            return True
         return False
 
-    # Remove trailing slash for consistent URL construction
-    base_endpoint = endpoint.rstrip('/')
+
+# ============================================================================
+# Task Management
+# ============================================================================
+
+@dataclass
+class Task:
+    """Represents a running task."""
+    id: str
+    user_id: int
+    channel_id: int
+    description: str
+    status: str = "running"  # running, completed, failed
+    start_time: datetime = field(default_factory=datetime.now)
+    end_time: Optional[datetime] = None
+    result: Optional[str] = None
+
+
+class TaskManager:
+    """Manages long-running tasks."""
     
-    # The endpoint is typically 'http://127.0.0.1:8317/v1'
-    # We need to check /v1/models (which is just /models appended to the endpoint)
-    # Also try the base URL without /v1 for compatibility
+    def __init__(self):
+        self._tasks: dict[str, Task] = {}
+        self._counter = 0
     
-    # Build the correct URLs to check
-    urls_to_check = []
+    def create_task(
+        self, 
+        user_id: int, 
+        channel_id: int, 
+        description: str
+    ) -> Task:
+        """Create a new task."""
+        self._counter += 1
+        task_id = f"task_{int(time.time())}_{self._counter}"
+        task = Task(
+            id=task_id,
+            user_id=user_id,
+            channel_id=channel_id,
+            description=description
+        )
+        self._tasks[task_id] = task
+        return task
     
-    if base_endpoint.endswith('/v1'):
-        # Endpoint already has /v1, so /models is correct
-        urls_to_check.append(f"{base_endpoint}/models")
-        # Also try base URL health check
-        base_url = base_endpoint[:-3]  # Remove /v1
-        urls_to_check.append(f"{base_url}/health")
-        urls_to_check.append(base_url)
-    else:
-        # Endpoint doesn't have /v1, try with and without
-        urls_to_check.append(f"{base_endpoint}/v1/models")
-        urls_to_check.append(f"{base_endpoint}/models")
-        urls_to_check.append(f"{base_endpoint}/health")
-        urls_to_check.append(base_endpoint)
-
-    for url in urls_to_check:
-        try:
-            headers = {
-                'Authorization': f'Bearer {os.getenv("OPENAI_API_KEY", "cliproxy-direct-mode")}'
-            }
-
-            async with aiohttp.ClientSession() as session:
-                # Try to get the list of available models as a readiness check
-                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    if response.status in [200, 204]:  # 204 might be returned by some endpoints
-                        api_ready = True
-                        print(f"API is ready to accept requests at {url}")
-                        return True
-                    else:
-                        print(f"API not ready at {url}, status: {response.status}")
-        except asyncio.TimeoutError:
-            print(f"Timeout checking API readiness at {url}")
-        except Exception as e:
-            print(f"Error checking API readiness at {url}: {e}")
-
-    return False
-
-async def handle_general_query(message, query):
-    """Handle a general query to the Strix agent using the LLM"""
-    global api_ready
-
-    # Check if API is ready, if not try to initialize it
-    if not api_ready:
-        await message.channel.send("⏳ Checking API readiness...")
-        api_ready = await check_api_readiness()
-
-        if not api_ready:
-            # Retry after a short delay
-            await asyncio.sleep(5)
-            api_ready = await check_api_readiness()
-
-    if not api_ready:
-        await message.channel.send("❌ API is not ready. Please wait for the Strix infrastructure to be fully initialized.")
-        return
-
-    try:
-        # Get conversation history for context
-        context_history = get_conversation_context(message.author.id, message.channel.id)
-
-        # Prepare the messages for the LLM with conversation history
-        llm_messages = [
-            {"role": "system", "content": "You are a cybersecurity expert and security agent. Provide helpful, accurate responses focusing on security aspects."}
+    def get_task(self, task_id: str) -> Optional[Task]:
+        return self._tasks.get(task_id)
+    
+    def complete_task(self, task_id: str, result: str) -> None:
+        if task_id in self._tasks:
+            self._tasks[task_id].status = "completed"
+            self._tasks[task_id].end_time = datetime.now()
+            self._tasks[task_id].result = result
+    
+    def fail_task(self, task_id: str, error: str) -> None:
+        if task_id in self._tasks:
+            self._tasks[task_id].status = "failed"
+            self._tasks[task_id].end_time = datetime.now()
+            self._tasks[task_id].result = error
+    
+    def get_active_tasks(self, user_id: int) -> list[Task]:
+        return [
+            t for t in self._tasks.values() 
+            if t.user_id == user_id and t.status == "running"
         ]
 
-        # Add previous conversation history
-        for entry in context_history:
-            llm_messages.append({"role": "user", "content": entry['user']})
-            llm_messages.append({"role": "assistant", "content": entry['ai']})
 
-        # Add the current query
-        llm_messages.append({"role": "user", "content": query})
+# ============================================================================
+# LLM Client
+# ============================================================================
 
-        # Call the LLM through the CLIProxyAPI endpoint
-        base_endpoint = os.getenv('CLIPROXY_ENDPOINT')
-        model = os.getenv('CLIPROXY_MODEL')
-
-        if not base_endpoint or not model:
-            await message.channel.send("❌ Configuration error: Missing CLIPROXY_ENDPOINT or CLIPROXY_MODEL")
-            return
-
-        # Construct the correct chat completions URL
-        chat_url = get_chat_completions_url(base_endpoint)
-        print(f"[DEBUG] Using chat completions URL: {chat_url}")
-
+class LLMClient:
+    """Client for interacting with the LLM API."""
+    
+    def __init__(self, config: BotConfig):
+        self.config = config
+        self.session: Optional[aiohttp.ClientSession] = None
+    
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession()
+        return self.session
+    
+    async def close(self) -> None:
+        if self.session and not self.session.closed:
+            await self.session.close()
+    
+    def _get_chat_url(self) -> str:
+        """Construct the chat completions URL."""
+        base = self.config.cliproxy_endpoint.rstrip('/')
+        if base.endswith('/chat/completions'):
+            return base
+        if base.endswith('/v1'):
+            return f"{base}/chat/completions"
+        return f"{base}/v1/chat/completions"
+    
+    async def generate(
+        self, 
+        messages: list[dict[str, str]],
+        temperature: float = 0.7,
+        max_tokens: int = 4000
+    ) -> str:
+        """Generate a response from the LLM."""
+        session = await self._ensure_session()
+        
+        url = self._get_chat_url()
         headers = {
             'Content-Type': 'application/json',
-            'Authorization': f'Bearer {os.getenv("OPENAI_API_KEY", "cliproxy-direct-mode")}'
+            'Authorization': f'Bearer {self.config.openai_api_key}'
         }
-
+        
+        # Prepare messages with system prompt
+        full_messages = [
+            {"role": "system", "content": STRIX_SYSTEM_PROMPT}
+        ] + messages
+        
         payload = {
-            'model': model,
-            'messages': llm_messages,
-            'temperature': 0.7,
-            'max_tokens': 1000
+            'model': self.config.cliproxy_model,
+            'messages': full_messages,
+            'temperature': temperature,
+            'max_tokens': max_tokens
         }
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(chat_url, headers=headers, json=payload) as response:
+        
+        logger.debug(f"Sending request to {url}")
+        
+        try:
+            async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=300)) as response:
                 if response.status == 200:
                     data = await response.json()
-                    # Handle both standard OpenAI format and potential variations
                     if 'choices' in data and len(data['choices']) > 0:
-                        if 'message' in data['choices'][0]:
-                            llm_response = data['choices'][0]['message']['content'].strip()
-                        elif 'delta' in data['choices'][0] and 'content' in data['choices'][0]['delta']:
-                            llm_response = data['choices'][0]['delta']['content'].strip()
-                        else:
-                            # Fallback to first available content
-                            llm_response = str(data['choices'][0])
-                    else:
-                        # If the response format is unexpected, show the raw response
-                        llm_response = f"Unexpected response format: {data}"
-
-                    # Add to conversation memory
-                    add_to_conversation_memory(message.author.id, message.channel.id, query, llm_response)
-
-                    # Send the response back to the user
-                    await message.channel.send(f"🤖 Strix Agent Response:\n{llm_response}")
-                elif response.status == 404:
-                    await message.channel.send(f"❌ Endpoint not found. Please check the CLIPROXY_ENDPOINT configuration. Status: {response.status}")
-                elif response.status == 401:
-                    await message.channel.send(f"❌ Unauthorized: Please check your API key. Status: {response.status}")
-                elif response.status == 429:
-                    await message.channel.send(f"❌ Rate limited: Too many requests. Status: {response.status}")
+                        choice = data['choices'][0]
+                        if 'message' in choice:
+                            return choice['message']['content'].strip()
+                        elif 'delta' in choice and 'content' in choice['delta']:
+                            return choice['delta']['content'].strip()
+                    return f"Unexpected response format: {data}"
                 else:
                     error_text = await response.text()
-                    await message.channel.send(f"❌ Failed to get response from the Strix agent. Status: {response.status}, Error: {error_text}")
-    except aiohttp.ClientConnectorError:
-        await message.channel.send("❌ Cannot connect to the API endpoint. Please check the network connection and endpoint configuration.")
-    except asyncio.TimeoutError:
-        await message.channel.send("⏰ Request timed out. Please try again.")
-    except Exception as e:
-        await message.channel.send(f"❌ Error processing your query: {str(e)}")
-
-@bot.command(name='scan')
-async def scan(ctx, target: str = None):
-    """Initiate a security scan on the specified target"""
-    if not target:
-        await ctx.send("❌ Please specify a target to scan. Usage: `!scan <target>`")
-        return
-
-    # Validate target format to prevent command injection
-    if not validate_target(target):
-        await ctx.send("❌ Invalid target format. Only domains, IPs, and URLs are allowed.")
-        return
-
-    # Create a new job
-    job_id = f"job_{int(time.time())}"
-    global current_job_id
-    current_job_id = job_id
-
-    # Track the active scan with user info
-    active_scans[job_id] = {
-        'user_id': ctx.author.id,
-        'channel_id': ctx.channel.id,
-        'target': target,
-        'start_time': datetime.now()
-    }
-
-    # Send initial message
-    msg = await ctx.send(f"🔍 Starting security scan on `{target}` (Job ID: {job_id})...")
-
-    # Run the scan in a separate thread to not block the bot
-    def run_scan():
-        try:
-            # Create a temporary directory for scan results
-            with tempfile.TemporaryDirectory() as temp_dir:
-                # Determine which scanning tool to use based on target type
-                if target.startswith(('http://', 'https://')):
-                    # Use a DAST tool like nikto or nmap for web apps
-                    cmd = [
-                        'docker', 'run', '--rm',
-                        '-v', f'{temp_dir}:/results',
-                        '-e', f'TARGET={target}',
-                        '-e', 'CLIPROXY_ENDPOINT=' + os.getenv('CLIPROXY_ENDPOINT'),
-                        '-e', 'CLIPROXY_MODEL=' + os.getenv('CLIPROXY_MODEL'),
-                        os.getenv('STRIX_IMAGE'),
-                        'nuclei', '-u', target, '-o', f'/results/{job_id}_nuclei_results.txt'
-                    ]
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)  # 30 minute timeout
-
-                    # Also run additional scans
-                    subprocess.run([
-                        'docker', 'run', '--rm',
-                        '-v', f'{temp_dir}:/results',
-                        os.getenv('STRIX_IMAGE'),
-                        'nmap', '-sV', target, '-oN', f'/results/{job_id}_nmap_results.txt'
-                    ], timeout=1800)
-
-                else:
-                    # Use SAST tools for code repositories
-                    cmd = [
-                        'docker', 'run', '--rm',
-                        '-v', f'{temp_dir}:/results',
-                        '-e', 'CLIPROXY_ENDPOINT=' + os.getenv('CLIPROXY_ENDPOINT'),
-                        '-e', 'CLIPROXY_MODEL=' + os.getenv('CLIPROXY_MODEL'),
-                        os.getenv('STRIX_IMAGE'),
-                        'semgrep', '--config=auto', target, '--json', f'-o', f'/results/{job_id}_semgrep_results.json'
-                    ]
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-
-                # Read results
-                results = {}
-                for filename in os.listdir(temp_dir):
-                    filepath = os.path.join(temp_dir, filename)
-                    with open(filepath, 'r') as f:
-                        results[filename] = f.read()
-
-                # Store results
-                job_results[job_id] = {
-                    'target': target,
-                    'timestamp': datetime.now().isoformat(),
-                    'results': results,
-                    'status': 'completed'
-                }
-
-                # Send results to Discord with notifications
-                asyncio.run_coroutine_threadsafe(send_results_to_discord_with_notification(job_id), bot.loop)
-
-        except subprocess.TimeoutExpired:
-            job_results[job_id] = {
-                'target': target,
-                'timestamp': datetime.now().isoformat(),
-                'results': {'error': 'Scan timed out after 30 minutes'},
-                'status': 'timeout'
-            }
-            asyncio.run_coroutine_threadsafe(send_timeout_notification(job_id), bot.loop)
+                    logger.error(f"LLM API error: {response.status} - {error_text}")
+                    return f"API Error ({response.status}): {error_text[:200]}"
+        except asyncio.TimeoutError:
+            return "Request timed out. The task may still be processing."
+        except aiohttp.ClientError as e:
+            logger.error(f"Connection error: {e}")
+            return f"Connection error: {str(e)}"
         except Exception as e:
-            job_results[job_id] = {
-                'target': target,
-                'timestamp': datetime.now().isoformat(),
-                'results': {'error': str(e)},
-                'status': 'error'
-            }
-            asyncio.run_coroutine_threadsafe(send_error_notification(job_id, str(e)), bot.loop)
+            logger.error(f"Unexpected error: {e}")
+            return f"Error: {str(e)}"
 
-    # Run the scan in a separate thread
-    scan_thread = threading.Thread(target=run_scan)
-    scan_thread.start()
 
-def validate_target(target):
-    """Validate target format to prevent command injection"""
-    import re
-    # Allow domains, IPs, and URLs
-    domain_pattern = r'^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9](\.[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9])*\.?$'
-    ip_pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
-    url_pattern = r'^https?://[^\s/$.?#].[^\s]*$'
+# ============================================================================
+# Discord Bot
+# ============================================================================
 
-    return (
-        re.match(domain_pattern, target) is not None or
-        re.match(ip_pattern, target) is not None or
-        re.match(url_pattern, target) is not None
-    )
-
-async def send_results_to_discord_with_notification(job_id):
-    """Send scan results to Discord with notifications"""
-    try:
-        scan_info = active_scans.get(job_id)
-        if not scan_info:
-            print(f"Could not find scan info for job {job_id}")
-            return
-
-        # Get the channel where the scan was initiated
-        channel = bot.get_channel(scan_info['channel_id'])
-        if not channel:
-            print(f"Could not find channel {scan_info['channel_id']}")
-            return
-
-        # Get the user who initiated the scan
-        guild = channel.guild
-        user = guild.get_member(scan_info['user_id']) if guild else None
-
-        # Find the Granter role
-        granter_role = None
-        if guild:
-            for role in guild.roles:
-                if 'granter' in role.name.lower():
-                    granter_role = role
-                    break
-
-        # Get the results
-        results = job_results.get(job_id, {})
-
-        # Send results with notifications
-        total_chars = 0
-        for filename, content in results.get('results', {}).items():
-            # Limit message length to Discord's 2000 character limit
-            content_str = str(content)
-            if len(content_str) > 1900:  # Leave room for prefix
-                content_str = content_str[:1900] + "... (truncated)"
-
-            message = f"📄 **{filename}**\n```\n{content_str}\n```"
-            await channel.send(message)
-            total_chars += len(message)
-
-            # If we're approaching rate limits, add a small delay
-            if total_chars > 5000:
-                await asyncio.sleep(1)
-                total_chars = 0
-
-        # Send completion message with mentions
-        completion_msg = f"✅ Scan job {job_id} completed for `{results.get('target', 'unknown')}`"
-        if user and granter_role:
-            completion_msg = f"✅ Scan job {job_id} completed for `{results.get('target', 'unknown')}`\nHey {user.mention} and <@&{granter_role.id}> - scan results are ready!"
-        elif user:
-            completion_msg = f"✅ Scan job {job_id} completed for `{results.get('target', 'unknown')}`\nHey {user.mention} - scan results are ready!"
-        elif granter_role:
-            completion_msg = f"✅ Scan job {job_id} completed for `{results.get('target', 'unknown')}`\nHey <@&{granter_role.id}> - scan results are ready!"
-
-        await channel.send(completion_msg)
-
-        # Remove from active scans
-        if job_id in active_scans:
-            del active_scans[job_id]
-
-    except Exception as e:
-        print(f"Error sending results with notification: {str(e)}")
-        # Try to send error to the original channel
-        scan_info = active_scans.get(job_id)
-        if scan_info:
-            channel = bot.get_channel(scan_info['channel_id'])
+class StrixBot(commands.Bot):
+    """The Strix Discord bot."""
+    
+    def __init__(self, config: BotConfig):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.members = True
+        intents.reactions = True
+        intents.guilds = True
+        
+        super().__init__(command_prefix='!', intents=intents)
+        
+        self.config = config
+        self.memory = ConversationMemory(max_entries=config.max_memory_entries)
+        self.tasks = TaskManager()
+        self.llm = LLMClient(config)
+        self.api_ready = False
+        
+        # Remove default help command to use custom one
+        self.remove_command('help')
+    
+    async def setup_hook(self) -> None:
+        """Set up the bot."""
+        # Add commands
+        self.add_command(self.cmd_help)
+        self.add_command(self.cmd_status)
+        self.add_command(self.cmd_clear)
+        self.add_command(self.cmd_tasks)
+    
+    async def on_ready(self) -> None:
+        """Called when the bot is ready."""
+        logger.info(f'Strix Discord bot is ready. Logged in as {self.user}')
+        
+        # Check API readiness
+        self.api_ready = await self._check_api_ready()
+        
+        # Send startup message to configured channel
+        if self.config.discord_channel_id:
+            channel = self.get_channel(self.config.discord_channel_id)
             if channel:
-                await channel.send(f"❌ Error sending scan results: {str(e)}")
+                embed = discord.Embed(
+                    title="Strix Security Agent Online",
+                    description="I'm ready to help with security assessments and analysis.",
+                    color=discord.Color.green()
+                )
+                embed.add_field(name="Model", value=self.config.cliproxy_model, inline=True)
+                embed.add_field(name="API Status", value="Ready" if self.api_ready else "Checking...", inline=True)
+                embed.add_field(
+                    name="How to Use", 
+                    value="Mention me with your message: `@Strix <your request>`",
+                    inline=False
+                )
+                await channel.send(embed=embed)
+    
+    async def _check_api_ready(self) -> bool:
+        """Check if the LLM API is ready."""
+        if not self.config.cliproxy_endpoint:
+            logger.warning("CLIPROXY_ENDPOINT not set")
+            return False
+        
+        base = self.config.cliproxy_endpoint.rstrip('/')
+        urls_to_check = [
+            f"{base}/models" if base.endswith('/v1') else f"{base}/v1/models",
+            base
+        ]
+        
+        session = await self.llm._ensure_session()
+        headers = {'Authorization': f'Bearer {self.config.openai_api_key}'}
+        
+        for url in urls_to_check:
+            try:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    if response.status in [200, 204]:
+                        logger.info(f"API ready at {url}")
+                        return True
+            except Exception as e:
+                logger.debug(f"API check failed at {url}: {e}")
+        
+        return False
+    
+    async def on_message(self, message: discord.Message) -> None:
+        """Handle incoming messages."""
+        # Ignore messages from the bot itself
+        if message.author == self.user:
+            return
+        
+        # Check if bot is mentioned
+        if self.user in message.mentions:
+            await self._handle_mention(message)
+        
+        # Process commands as well
+        await self.process_commands(message)
+    
+    async def _handle_mention(self, message: discord.Message) -> None:
+        """Handle a message that mentions the bot."""
+        # Extract the actual message content (remove the mention)
+        content = message.content
+        for mention in [f'<@{self.user.id}>', f'<@!{self.user.id}>']:
+            content = content.replace(mention, '').strip()
+        
+        if not content:
+            await message.channel.send(
+                "Hello! I'm Strix, your AI security agent. "
+                "How can I help you today? You can ask me to:\n"
+                "- Scan targets for vulnerabilities\n"
+                "- Analyze security configurations\n"
+                "- Help with penetration testing\n"
+                "- Answer security questions\n"
+                "- Execute commands and scripts\n\n"
+                "Just mention me with your request!"
+            )
+            return
+        
+        # Show typing indicator
+        if self.config.typing_indicator:
+            await message.channel.typing()
+        
+        # Check API readiness
+        if not self.api_ready:
+            self.api_ready = await self._check_api_ready()
+            if not self.api_ready:
+                await message.channel.send(
+                    "I'm still initializing. Please wait a moment and try again."
+                )
+                return
+        
+        # Add user message to memory
+        self.memory.add_message(
+            message.author.id,
+            message.channel.id,
+            "user",
+            content,
+            username=str(message.author)
+        )
+        
+        # Get conversation history
+        history = self.memory.get_history(message.author.id, message.channel.id)
+        
+        # Generate response
+        try:
+            response = await self.llm.generate(history)
+            
+            # Add assistant response to memory
+            self.memory.add_message(
+                message.author.id,
+                message.channel.id,
+                "assistant",
+                response
+            )
+            
+            # Send response (handle long messages)
+            await self._send_response(message.channel, response, message.author)
+            
+        except Exception as e:
+            logger.error(f"Error generating response: {e}")
+            await message.channel.send(
+                f"I encountered an error while processing your request: {str(e)}"
+            )
+    
+    async def _send_response(
+        self, 
+        channel: discord.TextChannel, 
+        content: str,
+        author: Optional[discord.User] = None
+    ) -> None:
+        """Send a response, splitting if necessary."""
+        # Split content into chunks if too long
+        max_len = self.config.max_message_length
+        
+        if len(content) <= max_len:
+            await channel.send(content)
+            return
+        
+        # Split on code blocks first, then paragraphs, then arbitrary
+        chunks = self._split_content(content, max_len)
+        
+        for i, chunk in enumerate(chunks):
+            if i == 0:
+                await channel.send(chunk)
+            else:
+                await asyncio.sleep(0.5)  # Rate limit protection
+                await channel.send(chunk)
+    
+    def _split_content(self, content: str, max_len: int) -> list[str]:
+        """Split content into chunks respecting code blocks."""
+        chunks = []
+        current = ""
+        
+        # Try to split on code blocks
+        parts = re.split(r'(```[\s\S]*?```)', content)
+        
+        for part in parts:
+            if len(current) + len(part) <= max_len:
+                current += part
+            else:
+                if current:
+                    chunks.append(current.strip())
+                
+                # If the part itself is too long, split it
+                if len(part) > max_len:
+                    # Split on newlines
+                    lines = part.split('\n')
+                    current = ""
+                    for line in lines:
+                        if len(current) + len(line) + 1 <= max_len:
+                            current += line + '\n'
+                        else:
+                            if current:
+                                chunks.append(current.strip())
+                            # If single line is too long, force split
+                            if len(line) > max_len:
+                                for j in range(0, len(line), max_len):
+                                    chunks.append(line[j:j+max_len])
+                                current = ""
+                            else:
+                                current = line + '\n'
+                else:
+                    current = part
+        
+        if current.strip():
+            chunks.append(current.strip())
+        
+        return chunks if chunks else [content[:max_len]]
+    
+    # ========================================================================
+    # Commands
+    # ========================================================================
+    
+    @commands.command(name='help')
+    async def cmd_help(self, ctx: commands.Context) -> None:
+        """Show help information."""
+        embed = discord.Embed(
+            title="Strix Security Agent - Help",
+            description="I'm an AI-powered security agent that can help with penetration testing, vulnerability assessment, and security analysis.",
+            color=discord.Color.blue()
+        )
+        
+        embed.add_field(
+            name="Interacting with Strix",
+            value="Simply mention me with your request:\n`@Strix scan example.com for vulnerabilities`\n`@Strix what security tools do you have?`\n`@Strix help me analyze this code`",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Commands",
+            value=(
+                "`!help` - Show this help message\n"
+                "`!status` - Check bot and API status\n"
+                "`!clear` - Clear conversation history\n"
+                "`!tasks` - Show your active tasks"
+            ),
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Capabilities",
+            value=(
+                "- Execute terminal commands and security tools\n"
+                "- Run Python scripts for automation\n"
+                "- Scan for vulnerabilities (nuclei, nmap, etc.)\n"
+                "- Web fuzzing and enumeration\n"
+                "- Code analysis and review\n"
+                "- And much more!"
+            ),
+            inline=False
+        )
+        
+        embed.set_footer(text="Strix by OmniSecure Labs")
+        await ctx.send(embed=embed)
+    
+    @commands.command(name='status')
+    async def cmd_status(self, ctx: commands.Context) -> None:
+        """Show bot status."""
+        # Re-check API status
+        self.api_ready = await self._check_api_ready()
+        
+        embed = discord.Embed(
+            title="Strix Status",
+            color=discord.Color.green() if self.api_ready else discord.Color.orange()
+        )
+        
+        embed.add_field(name="Bot Status", value="Online", inline=True)
+        embed.add_field(name="API Status", value="Ready" if self.api_ready else "Not Ready", inline=True)
+        embed.add_field(name="Model", value=self.config.cliproxy_model, inline=True)
+        embed.add_field(name="Endpoint", value=self.config.cliproxy_endpoint or "Not configured", inline=False)
+        
+        active_tasks = self.tasks.get_active_tasks(ctx.author.id)
+        embed.add_field(name="Your Active Tasks", value=str(len(active_tasks)), inline=True)
+        
+        await ctx.send(embed=embed)
+    
+    @commands.command(name='clear')
+    async def cmd_clear(self, ctx: commands.Context) -> None:
+        """Clear conversation history."""
+        if self.memory.clear(ctx.author.id, ctx.channel.id):
+            await ctx.send("Conversation history cleared.")
+        else:
+            await ctx.send("No conversation history to clear.")
+    
+    @commands.command(name='tasks')
+    async def cmd_tasks(self, ctx: commands.Context) -> None:
+        """Show active tasks."""
+        active_tasks = self.tasks.get_active_tasks(ctx.author.id)
+        
+        if not active_tasks:
+            await ctx.send("You have no active tasks.")
+            return
+        
+        embed = discord.Embed(
+            title="Your Active Tasks",
+            color=discord.Color.blue()
+        )
+        
+        for task in active_tasks:
+            duration = datetime.now() - task.start_time
+            embed.add_field(
+                name=f"Task {task.id}",
+                value=f"**Description:** {task.description[:100]}...\n**Running for:** {duration.seconds}s",
+                inline=False
+            )
+        
+        await ctx.send(embed=embed)
+    
+    async def close(self) -> None:
+        """Clean up resources."""
+        await self.llm.close()
+        await super().close()
 
 
-async def send_timeout_notification(job_id):
-    """Send timeout notification to Discord"""
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
+def main():
+    """Main entry point."""
+    config = BotConfig.from_env()
+    
+    if not config.discord_token:
+        logger.error("DISCORD_BOT_TOKEN environment variable not set")
+        return
+    
+    if not config.cliproxy_endpoint:
+        logger.warning("CLIPROXY_ENDPOINT not set - API calls may fail")
+    
+    logger.info(f"Starting Strix Discord Bot")
+    logger.info(f"Model: {config.cliproxy_model}")
+    logger.info(f"Endpoint: {config.cliproxy_endpoint}")
+    
+    bot = StrixBot(config)
+    
     try:
-        scan_info = active_scans.get(job_id)
-        if not scan_info:
-            print(f"Could not find scan info for job {job_id}")
-            return
-
-        # Get the channel where the scan was initiated
-        channel = bot.get_channel(scan_info['channel_id'])
-        if not channel:
-            print(f"Could not find channel {scan_info['channel_id']}")
-            return
-
-        # Get the user who initiated the scan
-        guild = channel.guild
-        user = guild.get_member(scan_info['user_id']) if guild else None
-
-        # Find the Granter role
-        granter_role = None
-        if guild:
-            for role in guild.roles:
-                if 'granter' in role.name.lower():
-                    granter_role = role
-                    break
-
-        # Send timeout message with mentions
-        timeout_msg = f"⏰ Scan for `{scan_info['target']}` timed out after 30 minutes."
-        if user and granter_role:
-            timeout_msg = f"⏰ Scan for `{scan_info['target']}` timed out after 30 minutes.\nHey {user.mention} and <@&{granter_role.id}> - please check the target."
-        elif user:
-            timeout_msg = f"⏰ Scan for `{scan_info['target']}` timed out after 30 minutes.\nHey {user.mention} - please check the target."
-        elif granter_role:
-            timeout_msg = f"⏰ Scan for `{scan_info['target']}` timed out after 30 minutes.\nHey <@&{granter_role.id}> - please check the target."
-
-        await channel.send(timeout_msg)
-
-        # Remove from active scans
-        if job_id in active_scans:
-            del active_scans[job_id]
-
+        bot.run(config.discord_token)
+    except KeyboardInterrupt:
+        logger.info("Bot shutting down...")
     except Exception as e:
-        print(f"Error sending timeout notification: {str(e)}")
+        logger.error(f"Bot error: {e}")
+        raise
 
 
-async def send_error_notification(job_id, error_msg):
-    """Send error notification to Discord"""
-    try:
-        scan_info = active_scans.get(job_id)
-        if not scan_info:
-            print(f"Could not find scan info for job {job_id}")
-            return
-
-        # Get the channel where the scan was initiated
-        channel = bot.get_channel(scan_info['channel_id'])
-        if not channel:
-            print(f"Could not find channel {scan_info['channel_id']}")
-            return
-
-        # Get the user who initiated the scan
-        guild = channel.guild
-        user = guild.get_member(scan_info['user_id']) if guild else None
-
-        # Find the Granter role
-        granter_role = None
-        if guild:
-            for role in guild.roles:
-                if 'granter' in role.name.lower():
-                    granter_role = role
-                    break
-
-        # Send error message with mentions
-        error_notification = f"❌ Error during scan of `{scan_info['target']}`: {error_msg}"
-        if user and granter_role:
-            error_notification = f"❌ Error during scan of `{scan_info['target']}`: {error_msg}\nHey {user.mention} and <@&{granter_role.id}> - please investigate."
-        elif user:
-            error_notification = f"❌ Error during scan of `{scan_info['target']}`: {error_msg}\nHey {user.mention} - please investigate."
-        elif granter_role:
-            error_notification = f"❌ Error during scan of `{scan_info['target']}`: {error_msg}\nHey <@&{granter_role.id}> - please investigate."
-
-        await channel.send(error_notification)
-
-        # Remove from active scans
-        if job_id in active_scans:
-            del active_scans[job_id]
-
-    except Exception as e:
-        print(f"Error sending error notification: {str(e)}")
-
-
-async def send_results_to_discord(channel, job_id, results):
-    """Send scan results to Discord"""
-    try:
-        total_chars = 0
-        for filename, content in results.items():
-            # Limit message length to Discord's 2000 character limit
-            content_str = str(content)
-            if len(content_str) > 1900:  # Leave room for prefix
-                content_str = content_str[:1900] + "... (truncated)"
-
-            message = f"📄 **{filename}**\n```\n{content_str}\n```"
-            await channel.send(message)
-            total_chars += len(message)
-
-            # If we're approaching rate limits, add a small delay
-            if total_chars > 5000:
-                await asyncio.sleep(1)
-                total_chars = 0
-
-        await channel.send(f"✅ Scan job {job_id} completed for `{results.get('target', 'unknown')}`")
-    except Exception as e:
-        await channel.send(f"❌ Error sending results to Discord: {str(e)}")
-
-@bot.command(name='status')
-async def status(ctx):
-    """Get the status of the current scan job"""
-    if current_job_id:
-        status_info = job_results.get(current_job_id, {'status': 'running'})
-        await ctx.send(f"📊 Current job {current_job_id}: {status_info.get('status', 'running')}")
-    else:
-        await ctx.send("ℹ️ No active scan jobs")
-
-@bot.command(name='clear_memory')
-async def clear_memory(ctx):
-    """Clear the conversation memory for the current user/channel"""
-    key = get_conversation_key(ctx.author.id, ctx.channel.id)
-    if key in conversation_memory:
-        del conversation_memory[key]
-        await ctx.send("🗑️ Conversation memory cleared for this channel.")
-    else:
-        await ctx.send("📋 No conversation memory to clear for this channel.")
-
-@bot.command(name='info')
-async def info_command(ctx):
-    """Show available commands"""
-    help_text = """
-🛡️ **Strix Security Agent Commands:**
-• `!scan <target>` - Initiate a security scan on the specified target
-• `!status` - Check the status of the current scan job
-• `!clear_memory` - Clear the conversation memory for this channel
-• `!info` - Show this help message
-• `@Strix scan <target>` - Mention the bot to initiate a scan
-• `@Strix <question>` - Ask the Strix agent a security question
-
-Supported targets:
-• Domains: example.com
-• IP addresses: 192.168.1.1
-• URLs: https://example.com"""
-    await ctx.send(help_text)
-
-# Run the bot
 if __name__ == "__main__":
-    bot.run(os.getenv('DISCORD_BOT_TOKEN'))
+    main()
