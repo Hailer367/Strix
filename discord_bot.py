@@ -28,6 +28,9 @@ active_scans = {}  # Track active scans with user info
 conversation_memory = {}  # Stores conversation history per user/channel
 MAX_MEMORY_ENTRIES = 10  # Maximum number of conversation entries to keep
 
+# API readiness check
+api_ready = False
+
 @bot.event
 async def on_ready():
     print(f'Discord bot is ready. Logged in as {bot.user}')
@@ -204,8 +207,52 @@ def get_conversation_context(user_id, channel_id):
 
     return conversation_memory[key]
 
+async def check_api_readiness():
+    """Check if the API is ready to accept requests"""
+    global api_ready
+    endpoint = os.getenv('CLIPROXY_ENDPOINT')
+
+    if not endpoint:
+        print("CLIPROXY_ENDPOINT not set")
+        return False
+
+    try:
+        headers = {
+            'Authorization': f'Bearer {os.getenv("OPENAI_API_KEY", "cliproxy-direct-mode")}'
+        }
+
+        async with aiohttp.ClientSession() as session:
+            # Try to get the list of available models as a readiness check
+            async with session.get(f"{endpoint}/models", headers=headers) as response:
+                if response.status == 200:
+                    api_ready = True
+                    print("API is ready to accept requests")
+                    return True
+                else:
+                    print(f"API not ready, status: {response.status}")
+                    return False
+    except Exception as e:
+        print(f"Error checking API readiness: {e}")
+        return False
+
 async def handle_general_query(message, query):
     """Handle a general query to the Strix agent using the LLM"""
+    global api_ready
+
+    # Check if API is ready, if not try to initialize it
+    if not api_ready:
+        await message.channel.send("⏳ Checking API readiness...")
+        api_ready = await check_api_readiness()
+
+        if not api_ready:
+            # Retry after a short delay
+            await asyncio.sleep(5)
+            api_ready = await check_api_readiness()
+
+    if not api_ready:
+        await message.channel.send("❌ API is not ready. Please wait for the Strix infrastructure to be fully initialized.")
+        return
+
     try:
         # Get conversation history for context
         context_history = get_conversation_context(message.author.id, message.channel.id)
