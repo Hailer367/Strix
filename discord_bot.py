@@ -227,6 +227,10 @@ async def handle_general_query(message, query):
         endpoint = os.getenv('CLIPROXY_ENDPOINT')
         model = os.getenv('CLIPROXY_MODEL')
 
+        if not endpoint or not model:
+            await message.channel.send("❌ Configuration error: Missing CLIPROXY_ENDPOINT or CLIPROXY_MODEL")
+            return
+
         headers = {
             'Content-Type': 'application/json',
             'Authorization': f'Bearer {os.getenv("OPENAI_API_KEY", "cliproxy-direct-mode")}'
@@ -243,15 +247,37 @@ async def handle_general_query(message, query):
             async with session.post(endpoint, headers=headers, json=payload) as response:
                 if response.status == 200:
                     data = await response.json()
-                    llm_response = data['choices'][0]['message']['content'].strip()
+                    # Handle both standard OpenAI format and potential variations
+                    if 'choices' in data and len(data['choices']) > 0:
+                        if 'message' in data['choices'][0]:
+                            llm_response = data['choices'][0]['message']['content'].strip()
+                        elif 'delta' in data['choices'][0] and 'content' in data['choices'][0]['delta']:
+                            llm_response = data['choices'][0]['delta']['content'].strip()
+                        else:
+                            # Fallback to first available content
+                            llm_response = str(data['choices'][0])
+                    else:
+                        # If the response format is unexpected, show the raw response
+                        llm_response = f"Unexpected response format: {data}"
 
                     # Add to conversation memory
                     add_to_conversation_memory(message.author.id, message.channel.id, query, llm_response)
 
                     # Send the response back to the user
                     await message.channel.send(f"🤖 Strix Agent Response:\n{llm_response}")
+                elif response.status == 404:
+                    await message.channel.send(f"❌ Endpoint not found. Please check the CLIPROXY_ENDPOINT configuration. Status: {response.status}")
+                elif response.status == 401:
+                    await message.channel.send(f"❌ Unauthorized: Please check your API key. Status: {response.status}")
+                elif response.status == 429:
+                    await message.channel.send(f"❌ Rate limited: Too many requests. Status: {response.status}")
                 else:
-                    await message.channel.send(f"❌ Failed to get response from the Strix agent. Status: {response.status}")
+                    error_text = await response.text()
+                    await message.channel.send(f"❌ Failed to get response from the Strix agent. Status: {response.status}, Error: {error_text}")
+    except aiohttp.ClientConnectorError:
+        await message.channel.send("❌ Cannot connect to the API endpoint. Please check the network connection and endpoint configuration.")
+    except asyncio.TimeoutError:
+        await message.channel.send("⏰ Request timed out. Please try again.")
     except Exception as e:
         await message.channel.send(f"❌ Error processing your query: {str(e)}")
 
