@@ -216,24 +216,28 @@ async def check_api_readiness():
         print("CLIPROXY_ENDPOINT not set")
         return False
 
-    try:
-        headers = {
-            'Authorization': f'Bearer {os.getenv("OPENAI_API_KEY", "cliproxy-direct-mode")}'
-        }
+    # Try multiple endpoints to check API readiness
+    endpoints_to_check = ["/models", "/v1/models", "/"]
 
-        async with aiohttp.ClientSession() as session:
-            # Try to get the list of available models as a readiness check
-            async with session.get(f"{endpoint}/models", headers=headers) as response:
-                if response.status == 200:
-                    api_ready = True
-                    print("API is ready to accept requests")
-                    return True
-                else:
-                    print(f"API not ready, status: {response.status}")
-                    return False
-    except Exception as e:
-        print(f"Error checking API readiness: {e}")
-        return False
+    for ep in endpoints_to_check:
+        try:
+            headers = {
+                'Authorization': f'Bearer {os.getenv("OPENAI_API_KEY", "cliproxy-direct-mode")}'
+            }
+
+            async with aiohttp.ClientSession() as session:
+                # Try to get the list of available models as a readiness check
+                async with session.get(f"{endpoint}{ep}", headers=headers) as response:
+                    if response.status in [200, 204]:  # 204 might be returned by some endpoints
+                        api_ready = True
+                        print(f"API is ready to accept requests at {endpoint}{ep}")
+                        return True
+                    else:
+                        print(f"API not ready at {endpoint}{ep}, status: {response.status}")
+        except Exception as e:
+            print(f"Error checking API readiness at {endpoint}{ep}: {e}")
+
+    return False
 
 async def handle_general_query(message, query):
     """Handle a general query to the Strix agent using the LLM"""
