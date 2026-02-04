@@ -1,0 +1,205 @@
+name: Strix - Autonomous Security Agent (Idle Mode)
+
+on:
+  workflow_dispatch:
+    inputs:
+      decryption_password:
+        description: 'Password to decrypt QWEN_TOKENS'
+        required: true
+        type: string
+      model:
+        description: 'AI Model to use'
+        required: false
+        default: 'qwen3-coder-plus'
+        type: choice
+        options:
+          - 'qwen3-coder-plus'
+          - 'qwen3-coder-flash'
+          - 'qwen3-max'
+          - 'qwen-plus'
+          - 'qwen-turbo'
+          - 'qwen2.5-coder-32b-instruct'
+
+env:
+  CLIPROXY_PORT: '8317'
+  STRIX_IMAGE: ghcr.io/89pl/strix-sandbox:latest
+
+jobs:
+  strix-runtime:
+    name: Strix Infrastructure Environment
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Setup Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Decrypt Qwen Tokens
+        id: decrypt
+        run: |
+          set -euo pipefail
+          echo "::group::Decrypting Qwen tokens"
+          if [ -z "${{ secrets.QWEN_TOKENS }}" ]; then
+            echo "::error::QWEN_TOKENS secret is not set"
+            exit 1
+          fi
+          mkdir -p ~/.cli-proxy-api
+          cd ~/.cli-proxy-api
+          echo "${{ secrets.QWEN_TOKENS }}" | base64 -d > qwen-tokens.enc
+          if ! echo "${{ github.event.inputs.decryption_password }}" | openssl enc -aes-256-cbc -d -salt -pbkdf2 -in qwen-tokens.enc -out qwen-tokens.tar.gz -pass stdin 2>/dev/null; then
+            echo "::error::Failed to decrypt tokens. Invalid password"
+            exit 1
+          fi
+          tar -xzf qwen-tokens.tar.gz
+          TOKEN_COUNT=$(find . -maxdepth 1 -name 'qwen-*.json' | wc -l)
+          echo "Successfully decrypted $TOKEN_COUNT Qwen account(s)"
+          echo "token_count=$TOKEN_COUNT" >> "$GITHUB_OUTPUT"
+          rm -f qwen-tokens.enc qwen-tokens.tar.gz
+          echo "::endgroup::"
+
+      - name: Install CLIProxyAPI
+        run: |
+          set -euo pipefail
+          echo "::group::Installing CLIProxyAPI"
+          git clone --depth 1 https://github.com/router-for-me/CLIProxyAPI.git /tmp/CLIProxyAPI
+          cd /tmp/CLIProxyAPI
+          go build -o cli-proxy-api ./cmd/server
+          sudo mv cli-proxy-api /usr/local/bin/
+          echo "CLIProxyAPI installed"
+          echo "::endgroup::"
+
+      - name: Install SAST Tools
+        run: |
+          set -euo pipefail
+          echo "::group::Installing SAST Tools"
+          pip install semgrep bandit trufflehog detect-secrets checkov safety pip-audit 2>/dev/null || true
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz | tar xz -C /usr/local/bin gitleaks 2>/dev/null || true
+          echo "::endgroup::"
+
+      - name: Install DAST Tools
+        run: |
+          set -euo pipefail
+          echo "::group::Installing DAST Tools"
+          sudo apt-get update -qq && sudo apt-get install -y -qq nmap nikto dnsutils whois jq curl wget unzip || true
+          curl -sSfL https://github.com/projectdiscovery/nuclei/releases/download/v3.2.9/nuclei_3.2.9_linux_amd64.zip -o /tmp/nuclei.zip && unzip -q /tmp/nuclei.zip -d /usr/local/bin 2>/dev/null || true
+          nuclei -update-templates 2>/dev/null || true
+          curl -sSfL https://github.com/ffuf/ffuf/releases/download/v2.1.0/ffuf_2.1.0_linux_amd64.tar.gz | tar xz -C /usr/local/bin ffuf 2>/dev/null || true
+          pip install sqlmap dirsearch 2>/dev/null || true
+          echo "::endgroup::"
+
+      - name: Configure CLIProxyAPI
+        run: |
+          set -euo pipefail
+          echo "::group::Configuring CLIProxyAPI"
+          AUTH_DIR="$HOME/.cli-proxy-api"
+          cat > "$AUTH_DIR/config.yaml" << EOF
+          host: "127.0.0.1"
+          port: 8317
+          auth-dir: "$AUTH_DIR"
+          debug: true
+          logging-to-file: true
+          request-retry: 5
+          max-retry-interval: 60
+          quota-exceeded:
+            switch-project: true
+            switch-preview-model: true
+          routing:
+            strategy: "round-robin"
+          EOF
+          echo "::endgroup::"
+
+      - name: Start CLIProxyAPI Server
+        id: cliproxy
+        run: |
+          set -euo pipefail
+          echo "::group::Starting CLIProxyAPI Server"
+          AUTH_DIR="$HOME/.cli-proxy-api"
+          cd "$AUTH_DIR"
+          nohup cli-proxy-api -config config.yaml > cliproxy.log 2>&1 &
+          SERVER_PID=$!
+          echo "$SERVER_PID" > cliproxy.pid
+          sleep 10
+          
+          # Wait for server ready
+          for i in {1..20}; do
+            if curl -s "http://127.0.0.1:${{ env.CLIPROXY_PORT }}/v1/models" > /dev/null 2>&1; then
+              echo "CLIProxyAPI is ready!"
+              break
+            fi
+            sleep 2
+          done
+          
+          ENDPOINT="http://127.0.0.1:${{ env.CLIPROXY_PORT }}/v1"
+          echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+      - name: Pull Strix Sandbox Image
+        run: |
+          echo "::group::Pulling latest Strix Sandbox image"
+          docker pull ${{ env.STRIX_IMAGE }}
+          echo "::endgroup::"
+
+      - name: Install Strix from Source
+        run: |
+          set -euo pipefail
+          echo "::group::Installing Strix from Source (https://github.com/89pl/Strix)"
+          git clone --depth 1 https://github.com/89pl/Strix /tmp/strix-source
+          cd /tmp/strix-source
+          pip install -e .
+          pip install jinja2 httpx tenacity requests pydantic rich docker textual xmltodict aiohttp
+          echo "Strix installed from source"
+          echo "::endgroup::"
+
+      - name: Setup Direct API Mode Environment
+        run: |
+          echo "CLIPROXY_ENDPOINT=${{ steps.cliproxy.outputs.endpoint }}" >> "$GITHUB_ENV"
+          echo "CLIPROXY_MODEL=${{ github.event.inputs.model }}" >> "$GITHUB_ENV"
+          echo "STRIX_LLM=${{ github.event.inputs.model }}" >> "$GITHUB_ENV"
+          echo "LLM_API_BASE=${{ steps.cliproxy.outputs.endpoint }}" >> "$GITHUB_ENV"
+          echo "OPENAI_API_KEY=cliproxy-direct-mode" >> "$GITHUB_ENV"
+          echo "OPENAI_API_BASE=${{ steps.cliproxy.outputs.endpoint }}" >> "$GITHUB_ENV"
+          echo "STRIX_DIRECT_API_MODE=true" >> "$GITHUB_ENV"
+
+      - name: Idle State - Waiting for Interaction
+        timeout-minutes: 360
+        run: |
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║           STRIX INFRASTRUCTURE READY (IDLE)                  ║"
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          echo "║  CLIProxyAPI: ${{ steps.cliproxy.outputs.endpoint }}"
+          echo "║  Model: ${{ github.event.inputs.model }}"
+          echo "║  Accounts: ${{ steps.decrypt.outputs.token_count }}"
+          echo "║  Mode: Direct API (STRIX_DIRECT_API_MODE=true)"
+          echo "║                                                              ║"
+          echo "║  Waiting for external interaction/Discord integration...     ║"
+          echo "║  Running until GitHub Action timeout (360m).                 ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          
+          # Keep the runner alive
+          sleep 21600
+
+      - name: Stop CLIProxyAPI Server
+        if: always()
+        run: |
+          AUTH_DIR="$HOME/.cli-proxy-api"
+          if [ -f "$AUTH_DIR/cliproxy.pid" ]; then
+            kill $(cat "$AUTH_DIR/cliproxy.pid") 2>/dev/null || true
+          fi
+          rm -rf "$AUTH_DIR"/qwen-*.json
