@@ -572,15 +572,15 @@ async def clear_memory(ctx):
     else:
         await ctx.send("📋 No conversation memory to clear for this channel.")
 
-@bot.command(name='help')
-async def help_command(ctx):
+@bot.command(name='info')
+async def info_command(ctx):
     """Show available commands"""
     help_text = """
 🛡️ **Strix Security Agent Commands:**
 • `!scan <target>` - Initiate a security scan on the specified target
 • `!status` - Check the status of the current scan job
 • `!clear_memory` - Clear the conversation memory for this channel
-• `!help` - Show this help message
+• `!info` - Show this help message
 • `@Strix scan <target>` - Mention the bot to initiate a scan
 • `@Strix <question>` - Ask the Strix agent a security question
 
