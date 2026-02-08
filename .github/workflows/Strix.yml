@@ -22,7 +22,7 @@ on:
 
 env:
   CLIPROXY_PORT: '8317'
-  STRIX_IMAGE: ghcr.io/89pl/strix-sandbox:latest
+  STRIX_IMAGE: ghcr.io/hailer367/strix/strix-sandbox:latest
 
 jobs:
   strix-runtime:
@@ -190,8 +190,8 @@ jobs:
       - name: Install Strix from Source
         run: |
           set -euo pipefail
-          echo "::group::Installing Strix from Source (https://github.com/89pl/Strix)"
-          git clone --depth 1 https://github.com/89pl/Strix /tmp/strix-source
+          echo "::group::Installing Strix from Source (https://github.com/Hailer367/Strix)"
+          git clone --depth 1 https://github.com/Hailer367/Strix /tmp/strix-source
           cd /tmp/strix-source
           pip install -e .
           pip install jinja2 httpx tenacity requests pydantic rich docker textual xmltodict aiohttp

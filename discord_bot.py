@@ -4,26 +4,32 @@ Strix Discord Bot - A Discord integration for the Strix AI Security Agent.
 
 This bot provides a Discord interface to interact with the full Strix agent,
 giving users access to all of Strix's capabilities including:
-- Terminal command execution
+- Terminal command execution (executed IN THE CONTAINER, not in Discord)
 - Python code execution
 - Browser automation
 - File operations
 - Web searching
 - Security scanning tools
-- Discord server management (channels, roles, permissions)
+- Discord server management (channels, roles, permissions) via discord.py API
 - And all other Strix tools
 
-The bot maintains conversation history and can execute long-running tasks
-asynchronously, notifying users when tasks are complete.
+Architecture:
+- Commands are executed in the container via subprocess/Strix agent
+- Discord operations use the discord.py API directly (NOT via LLM text)
+- LLM reasoning/thinking is NEVER shown to users
+- Only clean results and summaries are sent to Discord
+- Long-running tasks execute in background with progress updates
+- Users can communicate during active tasks without disruption
 
-Key Features:
-- Discord Admin Capabilities: Full server management powers
-- Task Complexity Detection: Distinguishes simple queries from complex operations
-- Long-Running Task Support: Background execution with progress updates
-- Non-Blocking Communication: Users can communicate during active tasks
+Inspired by MoltBot's task management:
+- Smart complexity detection with mid-task re-evaluation
+- Background execution with yield-based progress reporting
+- Non-blocking communication during active tasks
+- Thoroughness vs speed preference system
 """
 
 import asyncio
+import subprocess
 import discord
 from discord.ext import commands
 import os
@@ -31,9 +37,9 @@ import json
 import re
 import time
 import logging
-import threading
-from datetime import datetime, UTC
-from typing import Any, Optional, Callable
+import shlex
+from datetime import datetime, UTC, timedelta
+from typing import Any, Optional
 from enum import Enum
 import aiohttp
 from dataclasses import dataclass, field
@@ -48,20 +54,25 @@ logger = logging.getLogger('strix.discord')
 
 
 # ============================================================================
-# Task Complexity Classification
+# Task Complexity Classification (MoltBot-inspired)
 # ============================================================================
 
 class TaskComplexity(Enum):
     """Classification of task complexity levels."""
-    SIMPLE = "simple"           # Quick response, no tools needed (questions, greetings)
-    MODERATE = "moderate"       # Single tool execution, quick result
-    COMPLEX = "complex"         # Multi-step task, may take minutes
-    LONG_RUNNING = "long_running"  # Extended operation (scans, large analyses)
+    SIMPLE = "simple"               # Quick response, no tools needed
+    MODERATE = "moderate"           # Single tool execution, quick result
+    COMPLEX = "complex"             # Multi-step task, may take minutes
+    LONG_RUNNING = "long_running"   # Extended operation (scans, large analyses)
 
 
-# Patterns that indicate different task complexities
+class TaskPreference(Enum):
+    """User preference for task execution style (MoltBot-inspired)."""
+    THOROUGH = "thorough"   # Complete and comprehensive
+    QUICK = "quick"         # Fast, reasonable result
+    AUTO = "auto"           # Let the agent decide
+
+
 LONG_RUNNING_PATTERNS = [
-    # Scans and security assessments
     r'\b(deep|full|comprehensive|thorough|extensive|complete)\s*(scan|assessment|audit|test|analysis)',
     r'\b(scan|test|analyze|audit|assess|pentest|penetration.?test)\b.*\b(\d+\s*(?:hour|hr|minute|min)|long|full|deep)',
     r'\bvulnerability\s*(scan|assessment|audit|analysis)\b',
@@ -73,366 +84,306 @@ LONG_RUNNING_PATTERNS = [
     r'\bcrawl(?:ing)?\b.*(?:entire|full|complete|all)',
     r'\bmap(?:ping)?\s*(?:the\s*)?(?:entire|full|complete|all|attack)',
     r'\b(?:entire|full|complete)\s*(?:attack\s*)?surface\b',
-    
-    # Time indicators
     r'\b(\d+)\s*(?:hour|hr|minute|min)s?\b',
     r'\btake\s*(?:your|its)?\s*time\b',
     r'\bno\s*rush\b',
     r'\bthorough(?:ly)?\b',
     r'\bexhaustive(?:ly)?\b',
-    
-    # Multi-agent indicators
     r'\bcreate\s*(?:sub)?agents?\b',
     r'\bspawn\s*agents?\b',
     r'\bparallel\s*(?:scan|test|execution)',
     r'\bmulti(?:ple)?\s*(?:agent|thread|parallel)',
 ]
 
-# Keywords that indicate security-related complex tasks (but not necessarily long-running)
 COMPLEX_TASK_KEYWORDS = [
     'scan', 'test', 'analyze', 'find', 'discover', 'exploit',
     'vulnerability', 'security', 'pentest', 'enumerate', 'crawl',
-    'attack', 'surface', 'endpoint', 'injection', 'xss', 'ssrf', 'rce'
+    'attack', 'surface', 'endpoint', 'injection', 'xss', 'ssrf', 'rce',
+    'install', 'compile', 'build', 'deploy', 'configure', 'setup',
 ]
 
 SIMPLE_PATTERNS = [
-    # Questions and information requests (but NOT commands to DO something)
     r'^(?:what\s+is|who\s+is|where\s+is|when\s+is|why\s+is|how\s+does|can\s+you\s+explain|do\s+you\s+know|are\s+you|is\s+there)\b',
     r'^(?:hi|hello|hey|greetings|good\s*(?:morning|afternoon|evening))\b',
     r'^(?:thanks|thank you|ty|thx)\b',
     r'^(?:help|status|info|about)$',
     r'^(?:explain|describe|tell me about)\s',
-    
-    # Simple commands
     r'^!(?:help|status|clear|tasks)',
 ]
 
 DISCORD_ACTION_PATTERNS = [
-    # Channel operations - more flexible matching
     r'\b(?:create|make|add)\s+(?:a\s+)?(?:new\s+)?(?:channel|text.?channel|voice.?channel|category)',
     r'\b(?:delete|remove)\s+(?:the\s+)?(?:\w+[\s-]*)?channel',
     r'\b(?:rename|modify|edit|update)\s+(?:the\s+)?channel',
     r'\bchannel\s+(?:called|named)\b',
-    
-    # Role operations - more flexible matching
     r'\b(?:create|make|add)\s+(?:a\s+)?(?:new\s+)?role',
     r'\b(?:delete|remove)\s+(?:the\s+)?(?:\w+[\s-]*)?role',
-    r'\b(?:assign|give|grant|add|remove)\s+(?:a\s+)?(?:the\s+)?role',
+    r'\b(?:assign|give|grant|add)\s+(?:a\s+)?(?:the\s+)?(?:\w+\s+)*role',
     r'\b(?:rename|modify|edit|update)\s+(?:the\s+)?role',
     r'\brole\s+(?:named|called)\b',
-    
-    # Permission operations
     r'\b(?:set|change|modify|update|grant|revoke)\s+(?:the\s+)?permission',
-    
-    # Member operations - more flexible
     r'\b(?:kick|ban|unban|mute|unmute|timeout)\b',
-    
-    # Server operations
     r'\b(?:change|update|modify|set)\s+(?:the\s+)?server',
-    
-    # Message operations
     r'\b(?:delete|clear|purge)\s+(?:\d+\s+)?messages?',
     r'\b(?:pin|unpin)\s+(?:this\s+)?message',
+    r'\b(?:list|show|who)\s+(?:all\s+)?(?:members|users|roles|channels)',
+]
+
+CONTAINER_COMMAND_PATTERNS = [
+    r'\b(?:run|execute|exec)\s+(?:the\s+)?(?:command|cmd|script)',
+    r'\b(?:run|execute)\s+`[^`]+`',
+    r'\bnmap\b', r'\bnuclei\b', r'\bsqlmap\b', r'\bffuf\b',
+    r'\bpython\b', r'\bbash\b', r'\bshell\b', r'\bterminal\b',
+    r'\binstall\b', r'\bapt\b', r'\bpip\b', r'\bnpm\b',
+    r'\bgit\s+clone\b', r'\bcurl\b', r'\bwget\b',
+    r'\bls\b', r'\bcat\b', r'\bfind\b', r'\bgrep\b',
 ]
 
 
 def classify_task_complexity(message: str) -> TaskComplexity:
-    """
-    Classify the complexity of a user's request.
-    
-    This determines whether to use quick LLM response or full Strix agent execution.
-    Priority order:
-    1. Simple patterns FIRST (questions, greetings - even about security topics)
-    2. Long-running patterns (security assessments)
-    3. Discord action patterns (server management)
-    4. Complex task keywords with action verbs (commands to DO something)
-    5. Default based on word count
-    """
+    """Classify the complexity of a user's request."""
     message_lower = message.lower().strip()
     word_count = len(message.split())
-    
-    # Check for QUESTIONS and info requests FIRST (even about security topics)
-    # Questions like "What is SQL injection?" should be simple
+
+    # Questions and info requests FIRST
     question_patterns = [
         r'^(?:what\s+is|what\s+are|who\s+is|where\s+is|when|why|how\s+does|how\s+do|how\s+to)\b',
         r'^(?:can\s+you\s+explain|could\s+you\s+explain|please\s+explain)\b',
         r'^(?:tell\s+me\s+about|describe|explain)\b',
         r'^(?:do\s+you\s+know|is\s+there|are\s+there)\b',
-        r'\?$',  # Ends with question mark
+        r'\?$',
     ]
-    
     for pattern in question_patterns:
         if re.search(pattern, message_lower, re.IGNORECASE):
-            # It's a question - check if it's asking TO DO something or asking ABOUT something
             action_verbs = ['scan', 'test', 'hack', 'exploit', 'attack', 'pentest', 'fuzz', 'enumerate']
-            is_action_request = any(f'can you {v}' in message_lower or f'could you {v}' in message_lower 
-                                   for v in action_verbs)
+            is_action_request = any(
+                f'can you {v}' in message_lower or f'could you {v}' in message_lower
+                for v in action_verbs
+            )
             if not is_action_request:
                 return TaskComplexity.SIMPLE
-    
-    # Greetings and simple responses
+
+    # Greetings
     greeting_patterns = [
         r'^(?:hi|hello|hey|greetings|good\s*(?:morning|afternoon|evening)|yo|sup)\b',
         r'^(?:thanks|thank you|ty|thx|cheers)\b',
         r'^(?:ok|okay|sure|yes|no|yep|nope)\b',
         r'^!(?:help|status|clear|tasks|cancel)$',
     ]
-    
     for pattern in greeting_patterns:
         if re.search(pattern, message_lower, re.IGNORECASE):
             return TaskComplexity.SIMPLE
-    
-    # Check for long-running patterns (security assessments, scans)
+
+    # Long-running patterns
     for pattern in LONG_RUNNING_PATTERNS:
         if re.search(pattern, message_lower, re.IGNORECASE):
             return TaskComplexity.LONG_RUNNING
-    
-    # Check for Discord actions (server management)
+
+    # Discord actions -> moderate (executed directly via API)
     for pattern in DISCORD_ACTION_PATTERNS:
         if re.search(pattern, message_lower, re.IGNORECASE):
             return TaskComplexity.MODERATE
-    
-    # Action verbs that indicate the user wants something DONE
-    action_verbs = ['scan', 'test', 'analyze', 'find', 'discover', 'exploit', 
-                    'check', 'verify', 'audit', 'assess', 'review', 'inspect',
-                    'enumerate', 'crawl', 'fuzz', 'probe', 'attack']
-    
-    # Count action verb usage (not just mentions of security terms)
+
+    # Container command patterns -> moderate to complex
+    for pattern in CONTAINER_COMMAND_PATTERNS:
+        if re.search(pattern, message_lower, re.IGNORECASE):
+            return TaskComplexity.COMPLEX
+
+    action_verbs = [
+        'scan', 'test', 'analyze', 'find', 'discover', 'exploit',
+        'check', 'verify', 'audit', 'assess', 'review', 'inspect',
+        'enumerate', 'crawl', 'fuzz', 'probe', 'attack',
+    ]
     has_action = any(v in message_lower for v in action_verbs)
-    
-    # Count complex task keywords
     keyword_count = sum(1 for kw in COMPLEX_TASK_KEYWORDS if kw in message_lower)
-    
-    # If has action verb AND security keywords, it's a task to DO
+
     if has_action:
         if keyword_count >= 2:
             return TaskComplexity.COMPLEX
-        elif keyword_count >= 1:
+        if keyword_count >= 1:
             return TaskComplexity.MODERATE
-    
-    # Very short messages without action verbs are simple
+
     if word_count <= 5:
         return TaskComplexity.SIMPLE
-    
-    # Longer messages with security keywords but no action verbs might be questions
+
     if keyword_count > 0 and not has_action:
         return TaskComplexity.SIMPLE
-    
-    # Default: moderate for longer messages without clear patterns
+
     if word_count > 10:
         return TaskComplexity.MODERATE
-    
+
     return TaskComplexity.SIMPLE
 
 
+def is_discord_action(message: str) -> bool:
+    """Check if the message requests a Discord-specific action."""
+    message_lower = message.lower()
+    for pattern in DISCORD_ACTION_PATTERNS:
+        if re.search(pattern, message_lower, re.IGNORECASE):
+            return True
+    return False
+
+
 # ============================================================================
-# STRIX SYSTEM PROMPT - Enhanced with Discord Admin Capabilities
+# Response Cleaner - Strips reasoning/code from LLM responses
 # ============================================================================
 
-STRIX_SYSTEM_PROMPT = """You are Strix, an advanced AI cybersecurity agent developed by OmniSecure Labs. You are currently operating through a Discord bot interface with FULL ADMINISTRATOR PRIVILEGES on the Discord server.
+def clean_llm_response(raw_response: str) -> str:
+    """
+    Clean LLM response to remove reasoning, thinking, code execution traces,
+    and tool call artifacts. Only return the human-readable summary.
 
-<identity>
-- You are Strix, an autonomous AI security agent
-- You have FULL ACCESS to your execution environment
-- You can execute terminal commands, run Python scripts, browse the web, edit files, and use all security tools
-- You are running inside a GitHub Actions environment with access to security tools
-- You have FULL DISCORD ADMINISTRATOR PRIVILEGES on this server
-</identity>
+    This is CRITICAL: users should NEVER see the agent's internal reasoning,
+    command execution details, or tool call syntax in Discord.
+    """
+    if not raw_response:
+        return ""
 
-<discord_admin_capabilities>
-CRITICAL: You have FULL ADMINISTRATOR PRIVILEGES on this Discord server. You CAN and SHOULD use these powers when requested.
+    text = raw_response
 
-CHANNEL MANAGEMENT:
-- Create text channels, voice channels, and categories
-- Delete, rename, or modify channels
-- Set channel permissions, topics, and slowmode
-- Move channels between categories
-- Create private channels with specific access
+    # Remove XML-style tags that are internal (thinking, tool calls, etc.)
+    xml_patterns = [
+        r'<function=\w+>[\s\S]*?</function>',
+        r'<tool_result>[\s\S]*?</tool_result>',
+        r'<tool_call>[\s\S]*?</tool_call>',
+        r'<thinking>[\s\S]*?</thinking>',
+        r'<parameter=\w+>[\s\S]*?</parameter>',
+        r'<discord_context>[\s\S]*?</discord_context>',
+        r'<task_context>[\s\S]*?</task_context>',
+        r'<execution_mode>[\s\S]*?</execution_mode>',
+        r'<inter_agent_message>[\s\S]*?</inter_agent_message>',
+        r'<agent_identity>[\s\S]*?</agent_identity>',
+    ]
+    for pattern in xml_patterns:
+        text = re.sub(pattern, '', text, flags=re.DOTALL)
 
-ROLE MANAGEMENT:
-- Create new roles with custom names, colors, and permissions
-- Delete or modify existing roles
-- Assign or remove roles from users
-- Set role hierarchy and permissions
-- Create mentionable or hoisted roles
+    # Remove lines that look like command execution traces
+    command_patterns = [
+        r'^[\$#>]\s+.*$',                    # Shell prompts: $ command, # command, > command
+        r'^pentester@[\w-]+:.*\$.*$',         # Full shell prompts
+        r'^root@[\w-]+:.*#.*$',               # Root shell prompts
+        r'^\s*\+\s+.*$',                      # set -x trace lines
+        r'^\s*Running:?\s*`[^`]+`\s*$',       # "Running: `command`" lines
+        r'^\s*Executing:?\s*`[^`]+`\s*$',     # "Executing: `command`" lines
+        r'^\s*Command:?\s*`[^`]+`\s*$',       # "Command: `command`" lines
+    ]
+    lines = text.split('\n')
+    cleaned_lines = []
+    in_code_block = False
+    code_block_is_output = False
 
-USER MANAGEMENT:
-- Kick or ban users from the server
-- Timeout (mute) users for specified durations
-- Change user nicknames
-- Manage user roles
+    for line in lines:
+        stripped = line.strip()
 
-SERVER MANAGEMENT:
-- Modify server settings (name, icon, etc.)
-- Create and manage webhooks
-- Configure server verification level
-- Manage server emojis and stickers
+        # Track code blocks
+        if stripped.startswith('```'):
+            if in_code_block:
+                # End of code block
+                if code_block_is_output:
+                    cleaned_lines.append(line)
+                in_code_block = False
+                code_block_is_output = False
+                continue
+            # Start of code block - check if it's labeled as output/result
+            in_code_block = True
+            label = stripped[3:].strip().lower()
+            code_block_is_output = label in (
+                '', 'output', 'result', 'results', 'text', 'json',
+                'yaml', 'yml', 'xml', 'csv', 'md', 'markdown',
+            )
+            # Skip code blocks that look like command execution
+            if label in ('bash', 'sh', 'shell', 'zsh', 'cmd', 'powershell', 'python', 'py'):
+                code_block_is_output = False
+            if code_block_is_output:
+                cleaned_lines.append(line)
+            continue
 
-MESSAGE MANAGEMENT:
-- Delete messages (bulk delete supported)
-- Pin or unpin messages
-- Edit bot's own messages
-- Create embeds and formatted messages
+        if in_code_block:
+            if code_block_is_output:
+                cleaned_lines.append(line)
+            continue
 
-PERMISSION MANAGEMENT:
-- Set channel-specific permissions
-- Configure permission overwrites
-- Manage role permissions
+        # Skip command execution trace lines
+        is_trace = False
+        for pattern in command_patterns:
+            if re.match(pattern, line, re.MULTILINE):
+                is_trace = True
+                break
+        if is_trace:
+            continue
 
-HOW TO USE DISCORD CAPABILITIES:
-When a user asks you to perform Discord actions, you MUST actually do them, not just explain how.
-Use the discord.py library methods available through the bot context:
-- ctx.guild for server operations
-- ctx.guild.create_text_channel() for creating channels
-- ctx.guild.create_role() for creating roles
-- member.add_roles() for assigning roles
-- member.kick(), member.ban() for moderation
-- channel.set_permissions() for permissions
-- etc.
+        # Skip thinking/reasoning prefixes
+        skip_prefixes = [
+            'let me ', "i'll ", 'i will ', 'i need to ', 'first,', 'now,',
+            'step 1:', 'step 2:', 'step 3:', 'step 4:', 'step 5:',
+            'next,', 'then,', 'finally,', 'to do this,',
+            'i should ', 'i can ', "let's ", 'ok, ', 'okay, ',
+        ]
+        stripped_lower = stripped.lower()
+        # Only skip if the line is clearly internal reasoning (short planning lines)
+        if any(stripped_lower.startswith(p) for p in skip_prefixes):
+            # Keep it if it's part of a visible explanation (longer lines)
+            if len(stripped) < 80 and not any(c in stripped for c in '.!?'):
+                continue
 
-IMPORTANT: You have these permissions because the bot was set up with admin rights. Trust that you CAN perform these actions. Do NOT say "I don't have permission" or "I can't do that" - you CAN and you MUST when requested.
-</discord_admin_capabilities>
+        cleaned_lines.append(line)
 
-<capabilities>
-You have access to the following capabilities through your environment:
+    text = '\n'.join(cleaned_lines)
 
-TERMINAL & SHELL:
-- Execute any bash/shell commands
-- Run security tools like nmap, nuclei, nikto, sqlmap, ffuf, etc.
-- Install additional packages as needed
+    # Collapse multiple blank lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
 
-PYTHON EXECUTION:
-- Write and execute Python scripts
-- Use libraries like requests, aiohttp, beautifulsoup4, etc.
-- Automate complex tasks with scripts
+    return text.strip()
 
-SECURITY TOOLS AVAILABLE:
-- Network scanning: nmap, ncat, masscan
-- Vulnerability scanning: nuclei, nikto, wapiti
-- Web fuzzing: ffuf, dirsearch, gobuster
-- SQL injection: sqlmap
-- Subdomain enumeration: subfinder, amass
-- Web crawling: katana, gospider, httpx
-- Secret detection: trufflehog, gitleaks
-- Static analysis: semgrep, bandit
-- And many more...
 
-FILE OPERATIONS:
-- Read, write, and edit files
-- Navigate the filesystem
-- Process and analyze data
+# ============================================================================
+# SYSTEM PROMPTS
+# ============================================================================
 
-WEB BROWSING:
-- Browse websites
-- Take screenshots
-- Interact with web applications
-</capabilities>
+STRIX_SYSTEM_PROMPT = """You are Strix, an advanced AI cybersecurity agent developed by OmniSecure Labs. You are operating through a Discord bot interface.
 
-<communication_style>
-When responding to users on Discord:
-- Be helpful, direct, and actionable
-- When asked to perform tasks, DO them - don't just explain how
-- Show your work by sharing command outputs and results
-- Break down complex tasks into steps
-- Keep responses concise but informative
-- Use markdown formatting for code blocks and emphasis
-- If a task will take time, let the user know you're working on it
-- For Discord admin tasks, EXECUTE them immediately - don't ask for confirmation
-</communication_style>
+CRITICAL RULES FOR DISCORD RESPONSES:
+1. You MUST NEVER show your reasoning process, thinking, or internal planning to the user
+2. You MUST NEVER display commands you're about to run - just run them and report results
+3. You MUST NEVER use tool call syntax in your messages - tools are executed programmatically
+4. Keep responses CONCISE and ACTION-ORIENTED
+5. When executing tasks: describe what you DID and the RESULTS, not what you're GOING to do
+6. For security scans: show findings and recommendations, not the commands used
+7. For Discord admin tasks: confirm completion, not the API calls made
 
-<behavioral_rules>
-1. ALWAYS EXECUTE TASKS: When users ask you to scan, test, or analyze something, actually do it
-2. SHOW RESULTS: Share the actual outputs, findings, and results
-3. BE PROACTIVE: If you find issues, report them with details
-4. STAY FOCUSED: Complete the task at hand before moving to new topics
-5. BE HONEST: If you can't do something, explain why and suggest alternatives
-6. WORK AUTONOMOUSLY: Don't ask for permission for every step - proceed with the task
-7. RESPECT SCOPE: Only scan/test targets the user specifies
-8. USE ADMIN POWERS: When asked to manage Discord (channels, roles, etc.), DO IT immediately
-9. NO FALSE LIMITATIONS: Never claim you "can't" do Discord admin tasks - you CAN
-</behavioral_rules>
+RESPONSE STYLE:
+- Be direct and helpful
+- Report results, not process
+- Use clean markdown formatting
+- For long outputs, summarize key findings
+- Never expose internal tool calls or command syntax
 
-<response_format>
-For task execution:
-1. Acknowledge what you'll do
-2. Execute the necessary commands/scripts
-3. Share the results with relevant details
-4. Provide analysis or recommendations if applicable
+CAPABILITIES:
+- Security scanning and penetration testing (via container tools)
+- Terminal command execution (in the container)
+- Python scripting
+- File operations
+- Web browsing and analysis
+- Discord server management (channels, roles, permissions, users)
 
-For Discord admin tasks:
-1. Acknowledge the request
-2. Execute the Discord action IMMEDIATELY
-3. Confirm completion with details
+When asked to manage Discord (channels, roles, users), the bot handles this DIRECTLY via discord.py API. You just need to confirm the action and provide any specifics (like names, colors, etc.).
 
-For questions:
-- Provide clear, accurate answers
-- Include examples when helpful
-- Reference your available tools when relevant
-</response_format>
-
-Remember: You ARE Strix. You HAVE these capabilities. You CAN execute commands, tools, AND Discord admin actions. When users ask you to do something, DO IT - don't tell them you can't or that you're "just an AI". You are an AI agent with full execution capabilities AND full Discord administrator privileges.
+When asked to run commands or perform security tasks, these execute IN THE CONTAINER - not in Discord. You receive the results and should summarize them cleanly.
 """
 
+STRIX_LONG_TASK_SYSTEM_PROMPT = """You are Strix executing a LONG-RUNNING TASK. Be thorough and methodical.
 
-# ============================================================================
-# Long-Running Task System Prompt (for complex/long tasks)
-# ============================================================================
+RULES:
+1. Take your time - thoroughness over speed
+2. Report RESULTS only, never show commands or reasoning
+3. Provide periodic progress summaries (what's done, what's in progress)
+4. Work autonomously until complete
+5. If you discover significant findings, report them immediately
 
-STRIX_LONG_TASK_SYSTEM_PROMPT = """You are Strix, an advanced AI cybersecurity agent. You are now executing a LONG-RUNNING TASK that requires thorough, methodical execution.
-
-<execution_mode>
-LONG-RUNNING TASK MODE ACTIVATED
-
-This task has been identified as requiring extended execution time. You MUST:
-
-1. TAKE YOUR TIME: Do not rush. Thoroughness is more important than speed.
-2. CREATE SUB-AGENTS: For complex tasks, spawn specialized sub-agents to handle different aspects
-3. USE PROPER METHODOLOGY: Follow the full Strix security assessment methodology
-4. PROVIDE PROGRESS UPDATES: Periodically update the user on your progress
-5. DO NOT CUT CORNERS: Complete every step of the assessment properly
-6. WORK AUTONOMOUSLY: Continue working until the task is truly complete
-
-TASK DURATION EXPECTATIONS:
-- Quick scans: 5-15 minutes
-- Standard assessments: 30-60 minutes  
-- Deep/comprehensive scans: 2-6 hours
-- Exhaustive penetration tests: 6+ hours
-
-You have been given this task because the user expects THOROUGH results, not quick answers.
-</execution_mode>
-
-<multi_agent_guidelines>
-For substantial tasks, you SHOULD create sub-agents:
-
-1. RECONNAISSANCE AGENT - Asset discovery, enumeration, mapping
-2. VULNERABILITY AGENTS - One per vulnerability category (SQLi, XSS, SSRF, etc.)
-3. VALIDATION AGENTS - Confirm findings with PoCs
-4. REPORTING AGENTS - Document vulnerabilities properly
-
-Agent Creation Rules:
-- Each agent focuses on ONE specific task
-- Agents work in parallel for efficiency
-- Create agents as you discover new attack surfaces
-- Wait for agent completion before finalizing
-
-DO NOT just execute one command and declare the task complete. 
-DO spawn the appropriate agents and coordinate their work.
-DO wait for all agents to finish before providing final results.
-</multi_agent_guidelines>
-
-<progress_reporting>
-You should provide progress updates approximately every:
-- 30 seconds for quick tasks
-- 2-5 minutes for standard tasks
-- 10-15 minutes for long tasks
-
-Progress updates should include:
-- Current phase/step
-- What has been completed
-- What is in progress
-- Estimated remaining time (if known)
-- Any significant findings so far
-</progress_reporting>
+RESPONSE FORMAT FOR PROGRESS UPDATES:
+- Brief status line (what phase you're in)
+- Key findings so far
+- Estimated remaining work
 
 {base_prompt}
 """
@@ -454,9 +405,10 @@ class BotConfig:
     max_message_length: int = 1900
     max_memory_entries: int = 50
     typing_indicator: bool = True
-    long_task_timeout: int = 21600  # 6 hours max for long tasks
-    progress_update_interval: int = 120  # 2 minutes between progress updates
-    
+    long_task_timeout: int = 21600  # 6 hours max
+    progress_update_interval: int = 120  # 2 minutes
+    container_shell: str = "/bin/bash"
+
     @classmethod
     def from_env(cls) -> "BotConfig":
         """Load configuration from environment variables."""
@@ -474,93 +426,683 @@ class BotConfig:
 
 
 # ============================================================================
+# Container Command Executor
+# ============================================================================
+
+class ContainerExecutor:
+    """
+    Executes commands in the container environment, NOT in Discord.
+    This is the key fix: all command execution happens here, results are
+    reported back to Discord as clean summaries.
+    """
+
+    def __init__(self, shell: str = "/bin/bash"):
+        self.shell = shell
+        self.default_timeout = 120  # seconds
+        self.long_timeout = 3600    # 1 hour for long tasks
+        self._active_processes: dict[str, subprocess.Popen] = {}
+
+    async def execute(
+        self,
+        command: str,
+        timeout: Optional[int] = None,
+        cwd: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Execute a command in the container and return results."""
+        effective_timeout = timeout or self.default_timeout
+        effective_cwd = cwd or "/workspace"
+
+        logger.info(f"Container exec: {command[:100]}...")
+
+        try:
+            process = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    [self.shell, "-c", command],
+                    capture_output=True,
+                    text=True,
+                    timeout=effective_timeout,
+                    cwd=effective_cwd,
+                    env={**os.environ, "TERM": "dumb"},
+                ),
+            )
+            return {
+                "success": process.returncode == 0,
+                "stdout": process.stdout[:10000] if process.stdout else "",
+                "stderr": process.stderr[:5000] if process.stderr else "",
+                "exit_code": process.returncode,
+                "command": command,
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "success": False,
+                "stdout": "",
+                "stderr": f"Command timed out after {effective_timeout} seconds",
+                "exit_code": -1,
+                "command": command,
+            }
+        except FileNotFoundError:
+            return {
+                "success": False,
+                "stdout": "",
+                "stderr": f"Shell not found: {self.shell}",
+                "exit_code": -1,
+                "command": command,
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "stdout": "",
+                "stderr": str(e),
+                "exit_code": -1,
+                "command": command,
+            }
+
+    async def execute_background(
+        self,
+        command: str,
+        task_id: str,
+        cwd: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Start a background command execution."""
+        effective_cwd = cwd or "/workspace"
+        try:
+            process = subprocess.Popen(
+                [self.shell, "-c", command],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=effective_cwd,
+                env={**os.environ, "TERM": "dumb"},
+            )
+            self._active_processes[task_id] = process
+            return {
+                "success": True,
+                "pid": process.pid,
+                "task_id": task_id,
+                "status": "started",
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "task_id": task_id,
+                "status": "failed",
+            }
+
+    async def check_background(self, task_id: str) -> dict[str, Any]:
+        """Check status of a background process."""
+        process = self._active_processes.get(task_id)
+        if not process:
+            return {"status": "not_found", "task_id": task_id}
+
+        poll = process.poll()
+        if poll is None:
+            return {"status": "running", "task_id": task_id, "pid": process.pid}
+
+        stdout, stderr = process.communicate()
+        del self._active_processes[task_id]
+        return {
+            "status": "completed",
+            "success": poll == 0,
+            "exit_code": poll,
+            "stdout": stdout[:10000] if stdout else "",
+            "stderr": stderr[:5000] if stderr else "",
+            "task_id": task_id,
+        }
+
+    def kill_background(self, task_id: str) -> bool:
+        """Kill a background process."""
+        process = self._active_processes.get(task_id)
+        if process:
+            process.kill()
+            del self._active_processes[task_id]
+            return True
+        return False
+
+
+# ============================================================================
+# Discord Operations Handler
+# ============================================================================
+
+class DiscordOperations:
+    """
+    Handles Discord operations DIRECTLY via discord.py API.
+    This replaces the broken approach of asking the LLM to "write Discord commands".
+    The LLM decides WHAT to do, this class actually DOES it.
+    """
+
+    def __init__(self, bot: 'StrixBot'):
+        self.bot = bot
+
+    async def execute_discord_action(
+        self,
+        message: discord.Message,
+        action_text: str,
+        llm_guidance: str,
+    ) -> str:
+        """Parse and execute a Discord action based on LLM guidance and user request."""
+        guild = message.guild
+        if not guild:
+            return "This command can only be used in a server."
+
+        action_lower = action_text.lower()
+
+        try:
+            # Channel operations
+            if re.search(r'\b(?:create|make|add)\s+(?:a\s+)?(?:new\s+)?(?:text\s*)?channel', action_lower):
+                return await self._create_channel(guild, action_text, llm_guidance)
+
+            if re.search(r'\b(?:create|make|add)\s+(?:a\s+)?(?:new\s+)?voice\s*channel', action_lower):
+                return await self._create_voice_channel(guild, action_text, llm_guidance)
+
+            if re.search(r'\b(?:create|make|add)\s+(?:a\s+)?(?:new\s+)?category', action_lower):
+                return await self._create_category(guild, action_text, llm_guidance)
+
+            if re.search(r'\b(?:delete|remove)\s+.*channel', action_lower):
+                return await self._delete_channel(guild, action_text)
+
+            # Role operations
+            if re.search(r'\b(?:create|make|add)\s+(?:a\s+)?(?:new\s+)?role', action_lower):
+                return await self._create_role(guild, action_text, llm_guidance)
+
+            if re.search(r'\b(?:delete|remove)\s+.*role', action_lower):
+                return await self._delete_role(guild, action_text)
+
+            if re.search(r'\b(?:assign|give|grant|add)\s+.*role', action_lower):
+                return await self._assign_role(guild, message, action_text)
+
+            if re.search(r'\bremove\s+.*role\s+(?:from|of)', action_lower) or \
+               re.search(r'\bremove\s+(?:the\s+)?role', action_lower):
+                return await self._remove_role(guild, message, action_text)
+
+            # Member operations
+            if re.search(r'\bkick\b', action_lower):
+                return await self._kick_member(guild, message, action_text)
+
+            if re.search(r'\bban\b', action_lower):
+                return await self._ban_member(guild, message, action_text)
+
+            if re.search(r'\bunban\b', action_lower):
+                return await self._unban_member(guild, action_text)
+
+            if re.search(r'\b(?:timeout|mute)\b', action_lower):
+                return await self._timeout_member(guild, message, action_text)
+
+            # Information queries
+            if re.search(r'\b(?:list|show|who)\s+(?:all\s+)?members', action_lower):
+                return await self._list_members(guild)
+
+            if re.search(r'\b(?:list|show)\s+(?:all\s+)?roles', action_lower):
+                return await self._list_roles(guild)
+
+            if re.search(r'\b(?:list|show)\s+(?:all\s+)?channels', action_lower):
+                return await self._list_channels(guild)
+
+            # Message operations
+            if re.search(r'\b(?:delete|clear|purge)\s+(?:\d+\s+)?messages?', action_lower):
+                return await self._purge_messages(message)
+
+            return f"I understood this as a Discord action but couldn't determine the specific operation. Please be more specific about what you'd like me to do."
+
+        except discord.Forbidden:
+            return "I don't have the required permissions to perform this action. Please check my role permissions."
+        except discord.HTTPException as e:
+            return f"Discord API error: {e}"
+        except Exception as e:
+            logger.error(f"Discord operation error: {e}")
+            return f"Error performing Discord operation: {e}"
+
+    def _extract_name(self, text: str, keywords: list[str]) -> str:
+        """Extract a name from text after keywords like 'called', 'named'."""
+        for kw in keywords:
+            match = re.search(rf'{kw}\s+["\']?([^"\'\n,]+)["\']?', text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+
+        # Try to find quoted names
+        match = re.search(r'["\']([^"\']+)["\']', text)
+        if match:
+            return match.group(1).strip()
+
+        return ""
+
+    def _find_member(self, guild: discord.Guild, identifier: str) -> Optional[discord.Member]:
+        """Find a member by name, display name, mention, or ID."""
+        identifier = identifier.strip()
+
+        # Try mention format
+        match = re.match(r'<@!?(\d+)>', identifier)
+        if match:
+            return guild.get_member(int(match.group(1)))
+
+        # Try ID
+        if identifier.isdigit():
+            return guild.get_member(int(identifier))
+
+        # Try name/display name (case-insensitive)
+        identifier_lower = identifier.lower().strip('@').strip()
+        for member in guild.members:
+            if (member.name.lower() == identifier_lower or
+                    member.display_name.lower() == identifier_lower or
+                    str(member).lower() == identifier_lower or
+                    (member.global_name and member.global_name.lower() == identifier_lower)):
+                return member
+
+        return None
+
+    def _find_role(self, guild: discord.Guild, name: str) -> Optional[discord.Role]:
+        """Find a role by name (case-insensitive) or mention."""
+        name = name.strip()
+
+        # Try mention format
+        match = re.match(r'<@&(\d+)>', name)
+        if match:
+            return guild.get_role(int(match.group(1)))
+
+        # Try ID
+        if name.isdigit():
+            return guild.get_role(int(name))
+
+        name_lower = name.lower()
+        for role in guild.roles:
+            if role.name.lower() == name_lower:
+                return role
+
+        # Fuzzy match
+        for role in guild.roles:
+            if name_lower in role.name.lower() or role.name.lower() in name_lower:
+                return role
+
+        return None
+
+    def _find_channel(self, guild: discord.Guild, name: str) -> Optional[discord.abc.GuildChannel]:
+        """Find a channel by name (case-insensitive) or mention."""
+        name = name.strip()
+
+        match = re.match(r'<#(\d+)>', name)
+        if match:
+            return guild.get_channel(int(match.group(1)))
+
+        if name.isdigit():
+            return guild.get_channel(int(name))
+
+        name_lower = name.lower().replace('#', '').replace(' ', '-')
+        for channel in guild.channels:
+            if (channel.name.lower() == name_lower or
+                    channel.name.lower() == name.lower()):
+                return channel
+
+        return None
+
+    async def _create_channel(self, guild: discord.Guild, text: str, guidance: str) -> str:
+        name = self._extract_name(text, ['called', 'named', 'channel'])
+        if not name:
+            name = self._extract_name(guidance, ['called', 'named', 'channel', 'name'])
+        if not name:
+            return "Please specify a channel name. Example: 'create a channel called general-chat'"
+        name = name.lower().replace(' ', '-')
+        channel = await guild.create_text_channel(name=name)
+        return f"✅ Text channel **#{channel.name}** has been created."
+
+    async def _create_voice_channel(self, guild: discord.Guild, text: str, guidance: str) -> str:
+        name = self._extract_name(text, ['called', 'named', 'channel'])
+        if not name:
+            name = self._extract_name(guidance, ['called', 'named', 'channel', 'name'])
+        if not name:
+            return "Please specify a voice channel name."
+        channel = await guild.create_voice_channel(name=name)
+        return f"✅ Voice channel **{channel.name}** has been created."
+
+    async def _create_category(self, guild: discord.Guild, text: str, guidance: str) -> str:
+        name = self._extract_name(text, ['called', 'named', 'category'])
+        if not name:
+            name = self._extract_name(guidance, ['called', 'named', 'category', 'name'])
+        if not name:
+            return "Please specify a category name."
+        category = await guild.create_category(name=name)
+        return f"✅ Category **{category.name}** has been created."
+
+    async def _delete_channel(self, guild: discord.Guild, text: str) -> str:
+        name = self._extract_name(text, ['channel', 'delete', 'remove'])
+        if not name:
+            return "Please specify which channel to delete."
+        channel = self._find_channel(guild, name)
+        if not channel:
+            available = ', '.join([f'#{c.name}' for c in guild.text_channels[:20]])
+            return f"Channel '{name}' not found. Available channels: {available}"
+        channel_name = channel.name
+        await channel.delete()
+        return f"✅ Channel **#{channel_name}** has been deleted."
+
+    async def _create_role(self, guild: discord.Guild, text: str, guidance: str) -> str:
+        name = self._extract_name(text, ['called', 'named', 'role'])
+        if not name:
+            name = self._extract_name(guidance, ['called', 'named', 'role', 'name'])
+        if not name:
+            return "Please specify a role name."
+
+        color = discord.Color.default()
+        color_match = re.search(
+            r'\b(red|blue|green|yellow|orange|purple|pink|white|black|gold|teal|cyan|magenta)\b',
+            text.lower(),
+        )
+        if color_match:
+            color_map = {
+                'red': discord.Color.red(), 'blue': discord.Color.blue(),
+                'green': discord.Color.green(), 'yellow': discord.Color.yellow(),
+                'orange': discord.Color.orange(), 'purple': discord.Color.purple(),
+                'pink': discord.Color.pink(), 'white': discord.Color.from_rgb(255, 255, 255),
+                'black': discord.Color.from_rgb(0, 0, 0), 'gold': discord.Color.gold(),
+                'teal': discord.Color.teal(), 'cyan': discord.Color.from_rgb(0, 255, 255),
+                'magenta': discord.Color.magenta(),
+            }
+            color = color_map.get(color_match.group(1), discord.Color.default())
+
+        role = await guild.create_role(name=name, color=color, mentionable=True)
+        return f"✅ Role **{role.name}** has been created with color {color}."
+
+    async def _delete_role(self, guild: discord.Guild, text: str) -> str:
+        name = self._extract_name(text, ['role', 'delete', 'remove'])
+        if not name:
+            return "Please specify which role to delete."
+        role = self._find_role(guild, name)
+        if not role:
+            available = ', '.join([r.name for r in guild.roles if r.name != '@everyone'][:20])
+            return f"Role '{name}' not found. Available roles: {available}"
+        role_name = role.name
+        await role.delete()
+        return f"✅ Role **{role_name}** has been deleted."
+
+    async def _assign_role(self, guild: discord.Guild, message: discord.Message, text: str) -> str:
+        # Try to extract role and member from text
+        role_name = self._extract_name(text, ['role'])
+        member_patterns = [
+            r'(?:to|for)\s+<?@?!?(\w+)>?',
+            r'(?:give|assign|grant)\s+<?@?!?(\w+)>?\s+(?:the\s+)?role',
+        ]
+        member_name = ""
+        for pattern in member_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                member_name = match.group(1)
+                break
+
+        if not member_name and message.mentions:
+            member = message.mentions[0]
+        elif member_name:
+            member = self._find_member(guild, member_name)
+        else:
+            return "Please specify a member. Example: 'give @user the Admin role'"
+
+        if not member:
+            return f"Member '{member_name}' not found in this server."
+
+        if not role_name:
+            return "Please specify a role name."
+
+        role = self._find_role(guild, role_name)
+        if not role:
+            available = ', '.join([r.name for r in guild.roles if r.name != '@everyone'][:20])
+            return f"Role '{role_name}' not found. Available roles: {available}"
+
+        await member.add_roles(role)
+        return f"✅ Role **{role.name}** has been assigned to **{member.display_name}**."
+
+    async def _remove_role(self, guild: discord.Guild, message: discord.Message, text: str) -> str:
+        role_name = self._extract_name(text, ['role'])
+        member_patterns = [
+            r'(?:from)\s+<?@?!?(\w+)>?',
+            r'(?:remove)\s+.*role.*(?:from)\s+<?@?!?(\w+)>?',
+        ]
+        member_name = ""
+        for pattern in member_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                member_name = match.group(1) if match.group(1) else (match.group(2) if match.lastindex >= 2 else "")
+                break
+
+        if not member_name and message.mentions:
+            member = message.mentions[0]
+        elif member_name:
+            member = self._find_member(guild, member_name)
+        else:
+            # If the user says "remove the X role from me"
+            if 'from me' in text.lower() or 'my' in text.lower():
+                member = message.author if isinstance(message.author, discord.Member) else None
+            else:
+                return "Please specify a member. Example: 'remove the Admin role from @user'"
+
+        if not member:
+            return f"Member not found."
+
+        if not role_name:
+            # Try harder to find the role name
+            for word in text.split():
+                role = self._find_role(guild, word)
+                if role and role.name != '@everyone':
+                    role_name = role.name
+                    break
+
+        if not role_name:
+            return "Please specify a role name."
+
+        role = self._find_role(guild, role_name)
+        if not role:
+            available = ', '.join([r.name for r in guild.roles if r.name != '@everyone'][:20])
+            return f"Role '{role_name}' not found. Available roles: {available}"
+
+        if role not in member.roles:
+            return f"**{member.display_name}** doesn't have the **{role.name}** role."
+
+        await member.remove_roles(role)
+        return f"✅ Role **{role.name}** has been removed from **{member.display_name}**."
+
+    async def _kick_member(self, guild: discord.Guild, message: discord.Message, text: str) -> str:
+        member_name = ""
+        if message.mentions:
+            member = message.mentions[0]
+        else:
+            match = re.search(r'kick\s+<?@?!?(\w+)>?', text, re.IGNORECASE)
+            if match:
+                member_name = match.group(1)
+                member = self._find_member(guild, member_name)
+            else:
+                return "Please specify who to kick."
+
+        if not member:
+            return f"Member '{member_name}' not found."
+
+        await member.kick(reason=f"Kicked by Strix bot at request of {message.author}")
+        return f"✅ **{member.display_name}** has been kicked from the server."
+
+    async def _ban_member(self, guild: discord.Guild, message: discord.Message, text: str) -> str:
+        member_name = ""
+        if message.mentions:
+            member = message.mentions[0]
+        else:
+            match = re.search(r'ban\s+<?@?!?(\w+)>?', text, re.IGNORECASE)
+            if match:
+                member_name = match.group(1)
+                member = self._find_member(guild, member_name)
+            else:
+                return "Please specify who to ban."
+
+        if not member:
+            return f"Member '{member_name}' not found."
+
+        await member.ban(reason=f"Banned by Strix bot at request of {message.author}")
+        return f"✅ **{member.display_name}** has been banned from the server."
+
+    async def _unban_member(self, guild: discord.Guild, text: str) -> str:
+        match = re.search(r'unban\s+(\w+(?:#\d{4})?)', text, re.IGNORECASE)
+        if not match:
+            return "Please specify who to unban (username or username#discriminator)."
+
+        name = match.group(1)
+        bans = [entry async for entry in guild.bans()]
+        target = None
+        for ban_entry in bans:
+            if (ban_entry.user.name.lower() == name.lower() or
+                    str(ban_entry.user).lower() == name.lower()):
+                target = ban_entry.user
+                break
+
+        if not target:
+            return f"User '{name}' not found in ban list."
+
+        await guild.unban(target)
+        return f"✅ **{target}** has been unbanned."
+
+    async def _timeout_member(self, guild: discord.Guild, message: discord.Message, text: str) -> str:
+        member_name = ""
+        if message.mentions:
+            member = message.mentions[0]
+        else:
+            match = re.search(r'(?:timeout|mute)\s+<?@?!?(\w+)>?', text, re.IGNORECASE)
+            if match:
+                member_name = match.group(1)
+                member = self._find_member(guild, member_name)
+            else:
+                return "Please specify who to timeout."
+
+        if not member:
+            return f"Member '{member_name}' not found."
+
+        # Parse duration
+        duration_match = re.search(r'(\d+)\s*(min|minute|hour|hr|day|sec|second)', text.lower())
+        if duration_match:
+            amount = int(duration_match.group(1))
+            unit = duration_match.group(2)
+            if 'min' in unit:
+                seconds = amount * 60
+            elif 'hour' in unit or 'hr' in unit:
+                seconds = amount * 3600
+            elif 'day' in unit:
+                seconds = amount * 86400
+            else:
+                seconds = amount
+        else:
+            seconds = 300  # Default 5 minutes
+
+        await member.timeout(timedelta(seconds=seconds))
+        return f"✅ **{member.display_name}** has been timed out for {seconds // 60} minutes."
+
+    async def _list_members(self, guild: discord.Guild) -> str:
+        members = guild.members
+        member_list = []
+        for m in members[:50]:  # Limit to 50
+            roles = [r.name for r in m.roles if r.name != '@everyone']
+            role_str = f" [{', '.join(roles[:3])}]" if roles else ""
+            status = str(m.status) if hasattr(m, 'status') else "unknown"
+            member_list.append(f"• **{m.display_name}** ({m.name}){role_str} - {status}")
+
+        total = len(members)
+        shown = min(total, 50)
+        header = f"**Server Members ({shown}/{total}):**\n"
+        return header + '\n'.join(member_list)
+
+    async def _list_roles(self, guild: discord.Guild) -> str:
+        roles = sorted(guild.roles, key=lambda r: r.position, reverse=True)
+        role_list = []
+        for r in roles:
+            if r.name == '@everyone':
+                continue
+            member_count = len(r.members)
+            role_list.append(f"• **{r.name}** - {member_count} member(s) - Color: {r.color}")
+        return f"**Server Roles ({len(role_list)}):**\n" + '\n'.join(role_list)
+
+    async def _list_channels(self, guild: discord.Guild) -> str:
+        categories = {}
+        uncategorized = []
+        for channel in guild.channels:
+            if isinstance(channel, discord.CategoryChannel):
+                continue
+            cat = channel.category
+            if cat:
+                if cat.name not in categories:
+                    categories[cat.name] = []
+                categories[cat.name].append(channel)
+            else:
+                uncategorized.append(channel)
+
+        lines = [f"**Server Channels ({len(guild.channels)}):**"]
+        if uncategorized:
+            lines.append("**No Category:**")
+            for c in uncategorized:
+                prefix = "#" if isinstance(c, discord.TextChannel) else "🔊"
+                lines.append(f"  {prefix} {c.name}")
+        for cat_name, channels in categories.items():
+            lines.append(f"**{cat_name}:**")
+            for c in channels:
+                prefix = "#" if isinstance(c, discord.TextChannel) else "🔊"
+                lines.append(f"  {prefix} {c.name}")
+
+        return '\n'.join(lines)
+
+    async def _purge_messages(self, message: discord.Message) -> str:
+        match = re.search(r'(\d+)', message.content)
+        limit = int(match.group(1)) if match else 10
+        limit = min(limit, 100)
+        deleted = await message.channel.purge(limit=limit + 1)  # +1 for the command itself
+        return f"✅ Deleted {len(deleted) - 1} messages."
+
+
+# ============================================================================
 # Conversation Memory
 # ============================================================================
 
 @dataclass
 class ConversationEntry:
-    """A single conversation entry."""
-    role: str  # 'user' or 'assistant'
+    role: str
     content: str
     timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
     username: Optional[str] = None
-    task_id: Optional[str] = None  # Associated task if any
+    task_id: Optional[str] = None
 
 
 class ConversationMemory:
-    """Manages conversation history for users/channels."""
-    
     def __init__(self, max_entries: int = 50):
         self.max_entries = max_entries
         self._memory: dict[str, list[ConversationEntry]] = {}
         self._lock = asyncio.Lock()
-    
+
     def _get_key(self, user_id: int, channel_id: int) -> str:
         return f"{user_id}_{channel_id}"
-    
-    async def add_message(
-        self, 
-        user_id: int, 
-        channel_id: int, 
-        role: str, 
-        content: str,
-        username: Optional[str] = None,
-        task_id: Optional[str] = None
-    ) -> None:
-        """Add a message to conversation history (thread-safe)."""
+
+    async def add_message(self, user_id: int, channel_id: int, role: str, content: str,
+                          username: Optional[str] = None, task_id: Optional[str] = None) -> None:
         async with self._lock:
             key = self._get_key(user_id, channel_id)
             if key not in self._memory:
                 self._memory[key] = []
-            
             self._memory[key].append(ConversationEntry(
-                role=role,
-                content=content,
-                username=username,
-                task_id=task_id
+                role=role, content=content, username=username, task_id=task_id,
             ))
-            
-            # Trim to max entries
             if len(self._memory[key]) > self.max_entries:
                 self._memory[key] = self._memory[key][-self.max_entries:]
-    
+
     async def get_history(self, user_id: int, channel_id: int) -> list[dict[str, str]]:
-        """Get conversation history as list of message dicts (thread-safe)."""
         async with self._lock:
             key = self._get_key(user_id, channel_id)
             if key not in self._memory:
                 return []
-            
-            return [
-                {"role": entry.role, "content": entry.content}
-                for entry in self._memory[key]
-            ]
-    
+            return [{"role": e.role, "content": e.content} for e in self._memory[key]]
+
     async def clear(self, user_id: int, channel_id: int) -> bool:
-        """Clear conversation history for a user/channel (thread-safe)."""
         async with self._lock:
             key = self._get_key(user_id, channel_id)
             if key in self._memory:
                 del self._memory[key]
                 return True
             return False
-    
-    async def add_system_message(
-        self, 
-        user_id: int, 
-        channel_id: int, 
-        content: str
-    ) -> None:
-        """Add a system message to provide context."""
-        await self.add_message(user_id, channel_id, "system", content)
 
 
 # ============================================================================
-# Task Management (Enhanced for Long-Running Tasks)
+# Task Management (MoltBot-inspired)
 # ============================================================================
 
 class TaskStatus(Enum):
-    """Status of a task."""
     PENDING = "pending"
     RUNNING = "running"
     PAUSED = "paused"
@@ -571,77 +1113,80 @@ class TaskStatus(Enum):
 
 @dataclass
 class Task:
-    """Represents a running task."""
     id: str
     user_id: int
     channel_id: int
     description: str
     complexity: TaskComplexity
+    preference: TaskPreference = TaskPreference.AUTO
     status: TaskStatus = TaskStatus.PENDING
     start_time: datetime = field(default_factory=lambda: datetime.now(UTC))
     end_time: Optional[datetime] = None
     result: Optional[str] = None
-    progress: float = 0.0  # 0.0 to 1.0
+    progress: float = 0.0
     current_step: str = ""
     error: Optional[str] = None
     sub_tasks: list[str] = field(default_factory=list)
-    messages_during_task: list[str] = field(default_factory=list)  # User messages received during execution
+    messages_during_task: list[dict[str, str]] = field(default_factory=list)
     _asyncio_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    progress_message_id: Optional[int] = None
+    last_progress_update: Optional[datetime] = None
+    # MoltBot-inspired: mid-task complexity re-evaluation
+    re_evaluated: bool = False
+    original_complexity: Optional[TaskComplexity] = None
 
 
 class TaskManager:
-    """Manages long-running tasks with progress tracking."""
-    
+    """MoltBot-inspired task manager with smart complexity detection."""
+
     def __init__(self):
         self._tasks: dict[str, Task] = {}
         self._counter = 0
         self._lock = asyncio.Lock()
-    
-    async def create_task(
-        self, 
-        user_id: int, 
-        channel_id: int, 
-        description: str,
-        complexity: TaskComplexity
-    ) -> Task:
-        """Create a new task."""
+
+    async def create_task(self, user_id: int, channel_id: int, description: str,
+                          complexity: TaskComplexity,
+                          preference: TaskPreference = TaskPreference.AUTO) -> Task:
         async with self._lock:
             self._counter += 1
             task_id = f"task_{int(time.time())}_{self._counter}"
             task = Task(
-                id=task_id,
-                user_id=user_id,
-                channel_id=channel_id,
-                description=description,
-                complexity=complexity,
-                status=TaskStatus.PENDING
+                id=task_id, user_id=user_id, channel_id=channel_id,
+                description=description, complexity=complexity,
+                preference=preference, status=TaskStatus.PENDING,
+                original_complexity=complexity,
             )
             self._tasks[task_id] = task
             return task
-    
+
     async def get_task(self, task_id: str) -> Optional[Task]:
         async with self._lock:
             return self._tasks.get(task_id)
-    
-    async def update_progress(
-        self, 
-        task_id: str, 
-        progress: float, 
-        current_step: str = ""
-    ) -> None:
-        """Update task progress."""
+
+    async def update_progress(self, task_id: str, progress: float, current_step: str = "") -> None:
         async with self._lock:
             if task_id in self._tasks:
                 self._tasks[task_id].progress = min(1.0, max(0.0, progress))
                 if current_step:
                     self._tasks[task_id].current_step = current_step
-    
+                self._tasks[task_id].last_progress_update = datetime.now(UTC)
+
+    async def re_evaluate_complexity(self, task_id: str, new_complexity: TaskComplexity) -> None:
+        """MoltBot-inspired: re-evaluate task complexity mid-execution."""
+        async with self._lock:
+            if task_id in self._tasks:
+                task = self._tasks[task_id]
+                if not task.re_evaluated:
+                    task.original_complexity = task.complexity
+                    task.complexity = new_complexity
+                    task.re_evaluated = True
+
     async def start_task(self, task_id: str) -> None:
         async with self._lock:
             if task_id in self._tasks:
                 self._tasks[task_id].status = TaskStatus.RUNNING
                 self._tasks[task_id].start_time = datetime.now(UTC)
-    
+
     async def complete_task(self, task_id: str, result: str) -> None:
         async with self._lock:
             if task_id in self._tasks:
@@ -649,16 +1194,15 @@ class TaskManager:
                 self._tasks[task_id].end_time = datetime.now(UTC)
                 self._tasks[task_id].result = result
                 self._tasks[task_id].progress = 1.0
-    
+
     async def fail_task(self, task_id: str, error: str) -> None:
         async with self._lock:
             if task_id in self._tasks:
                 self._tasks[task_id].status = TaskStatus.FAILED
                 self._tasks[task_id].end_time = datetime.now(UTC)
                 self._tasks[task_id].error = error
-    
+
     async def cancel_task(self, task_id: str) -> bool:
-        """Cancel a running task."""
         async with self._lock:
             if task_id in self._tasks:
                 task = self._tasks[task_id]
@@ -669,698 +1213,434 @@ class TaskManager:
                         task._asyncio_task.cancel()
                     return True
             return False
-    
-    async def add_message_during_task(self, task_id: str, message: str) -> None:
-        """Add a user message received during task execution."""
+
+    async def add_message_during_task(self, task_id: str, author: str, message: str) -> None:
         async with self._lock:
             if task_id in self._tasks:
-                self._tasks[task_id].messages_during_task.append(message)
-    
+                self._tasks[task_id].messages_during_task.append({
+                    "author": author,
+                    "message": message,
+                    "time": datetime.now(UTC).isoformat(),
+                })
+
     async def get_active_tasks(self, user_id: int) -> list[Task]:
         async with self._lock:
             return [
-                t for t in self._tasks.values() 
+                t for t in self._tasks.values()
                 if t.user_id == user_id and t.status == TaskStatus.RUNNING
             ]
-    
+
     async def get_user_running_task(self, user_id: int, channel_id: int) -> Optional[Task]:
-        """Get the currently running task for a user in a channel."""
         async with self._lock:
             for task in self._tasks.values():
-                if (task.user_id == user_id and 
-                    task.channel_id == channel_id and 
-                    task.status == TaskStatus.RUNNING):
+                if (task.user_id == user_id and
+                        task.channel_id == channel_id and
+                        task.status == TaskStatus.RUNNING):
                     return task
             return None
 
 
 # ============================================================================
-# LLM Client (Enhanced for Long-Running Tasks)
+# LLM Client
 # ============================================================================
 
 class LLMClient:
-    """Client for interacting with the LLM API."""
-    
     def __init__(self, config: BotConfig):
         self.config = config
         self.session: Optional[aiohttp.ClientSession] = None
-    
+
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
             self.session = aiohttp.ClientSession()
         return self.session
-    
+
     async def close(self) -> None:
         if self.session and not self.session.closed:
             await self.session.close()
-    
+
     def _get_chat_url(self) -> str:
-        """Construct the chat completions URL."""
         base = self.config.cliproxy_endpoint.rstrip('/')
         if base.endswith('/chat/completions'):
             return base
         if base.endswith('/v1'):
             return f"{base}/chat/completions"
         return f"{base}/v1/chat/completions"
-    
-    async def generate(
-        self, 
-        messages: list[dict[str, str]],
-        system_prompt: str = STRIX_SYSTEM_PROMPT,
-        temperature: float = 0.7,
-        max_tokens: int = 4000,
-        timeout: int = 300
-    ) -> str:
-        """Generate a response from the LLM."""
+
+    async def generate(self, messages: list[dict[str, str]],
+                       system_prompt: str = STRIX_SYSTEM_PROMPT,
+                       temperature: float = 0.7, max_tokens: int = 4000,
+                       timeout: int = 300) -> str:
         session = await self._ensure_session()
-        
         url = self._get_chat_url()
         headers = {
             'Content-Type': 'application/json',
-            'Authorization': f'Bearer {self.config.openai_api_key}'
+            'Authorization': f'Bearer {self.config.openai_api_key}',
         }
-        
-        # Prepare messages with system prompt
-        full_messages = [
-            {"role": "system", "content": system_prompt}
-        ] + messages
-        
+        full_messages = [{"role": "system", "content": system_prompt}] + messages
         payload = {
             'model': self.config.cliproxy_model,
             'messages': full_messages,
             'temperature': temperature,
-            'max_tokens': max_tokens
+            'max_tokens': max_tokens,
         }
-        
-        logger.debug(f"Sending request to {url}")
-        
+
         try:
-            async with session.post(
-                url, 
-                headers=headers, 
-                json=payload, 
-                timeout=aiohttp.ClientTimeout(total=timeout)
-            ) as response:
+            async with session.post(url, headers=headers, json=payload,
+                                    timeout=aiohttp.ClientTimeout(total=timeout)) as response:
                 if response.status == 200:
                     data = await response.json()
                     if 'choices' in data and len(data['choices']) > 0:
                         choice = data['choices'][0]
                         if 'message' in choice:
-                            return choice['message']['content'].strip()
-                        elif 'delta' in choice and 'content' in choice['delta']:
-                            return choice['delta']['content'].strip()
-                    return f"Unexpected response format: {data}"
+                            raw = choice['message']['content'].strip()
+                            return clean_llm_response(raw)
+                        if 'delta' in choice and 'content' in choice['delta']:
+                            raw = choice['delta']['content'].strip()
+                            return clean_llm_response(raw)
+                    return "I processed your request but got an unexpected response format."
                 else:
                     error_text = await response.text()
                     logger.error(f"LLM API error: {response.status} - {error_text}")
-                    return f"API Error ({response.status}): {error_text[:200]}"
+                    return f"I encountered an API error. Please try again."
         except asyncio.TimeoutError:
-            return "Request timed out. The task may still be processing."
+            return "The request timed out. The task may still be processing."
         except aiohttp.ClientError as e:
             logger.error(f"Connection error: {e}")
-            return f"Connection error: {str(e)}"
+            return "I'm having trouble connecting to my AI backend. Please try again."
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
-            return f"Error: {str(e)}"
-    
-    async def generate_long_task_response(
-        self,
-        messages: list[dict[str, str]],
-        task_description: str,
-        progress_callback: Optional[Callable[[str], Any]] = None
-    ) -> str:
-        """
-        Generate a response for a long-running task with progress updates.
-        
-        This uses a special system prompt that instructs the agent to:
-        - Take its time and be thorough
-        - Create sub-agents as needed
-        - Follow the full Strix methodology
-        - Provide periodic progress updates
-        """
-        # Use the long-task system prompt
-        system_prompt = STRIX_LONG_TASK_SYSTEM_PROMPT.format(base_prompt=STRIX_SYSTEM_PROMPT)
-        
-        # Add task context to messages
-        task_context = f"""
-<task_context>
-LONG-RUNNING TASK INITIATED
-Task Description: {task_description}
-Execution Mode: THOROUGH (take your time, be comprehensive)
-Expected Behavior: Create sub-agents, follow full methodology, provide progress updates
-</task_context>
-
-USER REQUEST: {messages[-1]['content'] if messages else task_description}
-"""
-        
-        enhanced_messages = messages[:-1] + [{"role": "user", "content": task_context}] if messages else [{"role": "user", "content": task_context}]
-        
-        return await self.generate(
-            enhanced_messages,
-            system_prompt=system_prompt,
-            temperature=0.7,
-            max_tokens=8000,  # Larger context for complex tasks
-            timeout=self.config.long_task_timeout
-        )
+            return f"An unexpected error occurred. Please try again."
 
 
 # ============================================================================
-# Discord Admin Helper (Provides actual Discord operations)
-# ============================================================================
-
-class DiscordAdminHelper:
-    """Helper class for Discord admin operations."""
-    
-    def __init__(self, bot: 'StrixBot'):
-        self.bot = bot
-    
-    async def create_text_channel(
-        self, 
-        guild: discord.Guild, 
-        name: str, 
-        category: Optional[discord.CategoryChannel] = None,
-        topic: Optional[str] = None,
-        **kwargs
-    ) -> discord.TextChannel:
-        """Create a text channel."""
-        return await guild.create_text_channel(
-            name=name,
-            category=category,
-            topic=topic,
-            **kwargs
-        )
-    
-    async def create_voice_channel(
-        self,
-        guild: discord.Guild,
-        name: str,
-        category: Optional[discord.CategoryChannel] = None,
-        **kwargs
-    ) -> discord.VoiceChannel:
-        """Create a voice channel."""
-        return await guild.create_voice_channel(
-            name=name,
-            category=category,
-            **kwargs
-        )
-    
-    async def create_category(
-        self,
-        guild: discord.Guild,
-        name: str,
-        **kwargs
-    ) -> discord.CategoryChannel:
-        """Create a category."""
-        return await guild.create_category(name=name, **kwargs)
-    
-    async def create_role(
-        self,
-        guild: discord.Guild,
-        name: str,
-        color: Optional[discord.Color] = None,
-        permissions: Optional[discord.Permissions] = None,
-        hoist: bool = False,
-        mentionable: bool = False,
-        **kwargs
-    ) -> discord.Role:
-        """Create a role."""
-        return await guild.create_role(
-            name=name,
-            color=color or discord.Color.default(),
-            permissions=permissions or discord.Permissions.none(),
-            hoist=hoist,
-            mentionable=mentionable,
-            **kwargs
-        )
-    
-    async def delete_channel(self, channel: discord.abc.GuildChannel) -> None:
-        """Delete a channel."""
-        await channel.delete()
-    
-    async def delete_role(self, role: discord.Role) -> None:
-        """Delete a role."""
-        await role.delete()
-    
-    async def assign_role(self, member: discord.Member, role: discord.Role) -> None:
-        """Assign a role to a member."""
-        await member.add_roles(role)
-    
-    async def remove_role(self, member: discord.Member, role: discord.Role) -> None:
-        """Remove a role from a member."""
-        await member.remove_roles(role)
-    
-    async def kick_member(self, member: discord.Member, reason: Optional[str] = None) -> None:
-        """Kick a member from the server."""
-        await member.kick(reason=reason)
-    
-    async def ban_member(
-        self, 
-        member: discord.Member, 
-        reason: Optional[str] = None,
-        delete_message_days: int = 0
-    ) -> None:
-        """Ban a member from the server."""
-        await member.ban(reason=reason, delete_message_days=delete_message_days)
-    
-    async def timeout_member(
-        self,
-        member: discord.Member,
-        duration: int,  # seconds
-        reason: Optional[str] = None
-    ) -> None:
-        """Timeout a member."""
-        from datetime import timedelta
-        await member.timeout(timedelta(seconds=duration), reason=reason)
-    
-    async def bulk_delete_messages(
-        self,
-        channel: discord.TextChannel,
-        limit: int = 100
-    ) -> int:
-        """Bulk delete messages from a channel."""
-        deleted = await channel.purge(limit=limit)
-        return len(deleted)
-
-
-# ============================================================================
-# Discord Bot (Enhanced with Admin Capabilities and Long-Task Support)
+# Discord Bot
 # ============================================================================
 
 class StrixBot(commands.Bot):
-    """The Strix Discord bot with full admin capabilities and long-task support."""
-    
+    """The Strix Discord bot with actual container execution and direct Discord API ops."""
+
     def __init__(self, config: BotConfig):
-        intents = discord.Intents.all()  # Full intents for admin operations
-        
+        intents = discord.Intents.all()
         super().__init__(command_prefix='!', intents=intents)
-        
+
         self.config = config
         self.memory = ConversationMemory(max_entries=config.max_memory_entries)
         self.tasks = TaskManager()
         self.llm = LLMClient(config)
-        self.admin = DiscordAdminHelper(self)
+        self.executor = ContainerExecutor(shell=config.container_shell)
+        self.discord_ops = DiscordOperations(self)
         self.api_ready = False
-        
-        # Remove default help command to use custom one
         self.remove_command('help')
-    
+
     async def setup_hook(self) -> None:
-        """Set up the bot."""
-        # Add commands
         self.add_command(self.cmd_help)
         self.add_command(self.cmd_status)
         self.add_command(self.cmd_clear)
         self.add_command(self.cmd_tasks)
         self.add_command(self.cmd_cancel)
-    
+
     async def on_ready(self) -> None:
-        """Called when the bot is ready."""
         logger.info(f'Strix Discord bot is ready. Logged in as {self.user}')
-        
-        # Check API readiness
         self.api_ready = await self._check_api_ready()
-        
-        # Log guild information
+
         for guild in self.guilds:
-            permissions = guild.me.guild_permissions
+            perms = guild.me.guild_permissions
             logger.info(f'Connected to guild: {guild.name} (ID: {guild.id})')
-            logger.info(f'  Admin: {permissions.administrator}')
-            logger.info(f'  Manage Channels: {permissions.manage_channels}')
-            logger.info(f'  Manage Roles: {permissions.manage_roles}')
-            logger.info(f'  Manage Messages: {permissions.manage_messages}')
-        
-        # Send startup message to configured channel
+            logger.info(f'  Admin: {perms.administrator}')
+            logger.info(f'  Manage Channels: {perms.manage_channels}')
+            logger.info(f'  Manage Roles: {perms.manage_roles}')
+            logger.info(f'  Members cached: {len(guild.members)}')
+
         if self.config.discord_channel_id:
             channel = self.get_channel(self.config.discord_channel_id)
             if channel:
                 embed = discord.Embed(
                     title="🦉 Strix Security Agent Online",
-                    description="I'm ready to help with security assessments, server management, and more.",
-                    color=discord.Color.green()
+                    description="Ready for security assessments, server management, and more.",
+                    color=discord.Color.green(),
                 )
                 embed.add_field(name="Model", value=self.config.cliproxy_model, inline=True)
-                embed.add_field(name="API Status", value="✅ Ready" if self.api_ready else "⏳ Checking...", inline=True)
-                embed.add_field(name="Admin Mode", value="✅ Full Privileges", inline=True)
-                embed.add_field(
-                    name="How to Use", 
-                    value="Mention me with your message: `@Strix <your request>`\n"
-                          "I can perform security scans, manage channels/roles, and more!",
-                    inline=False
-                )
-                embed.add_field(
-                    name="Long-Running Tasks",
-                    value="For complex scans and assessments, I'll work in the background and keep you updated on progress.",
-                    inline=False
-                )
+                embed.add_field(name="API", value="✅ Ready" if self.api_ready else "⏳ Checking", inline=True)
+                embed.add_field(name="Admin", value="✅ Full Privileges", inline=True)
                 await channel.send(embed=embed)
-    
+
     async def _check_api_ready(self) -> bool:
-        """Check if the LLM API is ready."""
         if not self.config.cliproxy_endpoint:
-            logger.warning("CLIPROXY_ENDPOINT not set")
             return False
-        
         base = self.config.cliproxy_endpoint.rstrip('/')
-        urls_to_check = [
+        urls = [
             f"{base}/models" if base.endswith('/v1') else f"{base}/v1/models",
-            base
+            base,
         ]
-        
         session = await self.llm._ensure_session()
         headers = {'Authorization': f'Bearer {self.config.openai_api_key}'}
-        
-        for url in urls_to_check:
+        for url in urls:
             try:
-                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    if response.status in [200, 204]:
+                async with session.get(url, headers=headers,
+                                       timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status in [200, 204]:
                         logger.info(f"API ready at {url}")
                         return True
-            except Exception as e:
-                logger.debug(f"API check failed at {url}: {e}")
-        
+            except Exception:
+                pass
         return False
-    
+
     async def on_message(self, message: discord.Message) -> None:
-        """Handle incoming messages."""
-        # Ignore messages from the bot itself
         if message.author == self.user:
             return
-        
-        # Check if bot is mentioned
         if self.user in message.mentions:
             await self._handle_mention(message)
-        
-        # Process commands as well
         await self.process_commands(message)
-    
+
     async def _handle_mention(self, message: discord.Message) -> None:
-        """Handle a message that mentions the bot."""
-        # Extract the actual message content (remove the mention)
         content = message.content
         for mention in [f'<@{self.user.id}>', f'<@!{self.user.id}>']:
             content = content.replace(mention, '').strip()
-        
+
         if not content:
             await message.channel.send(
-                "Hello! I'm **Strix**, your AI security agent with full admin privileges. "
-                "I can help you with:\n"
-                "🔒 **Security**: Scans, pentesting, vulnerability assessment\n"
-                "⚙️ **Discord Admin**: Create channels, roles, manage permissions\n"
-                "🤖 **Automation**: Scripts, commands, file operations\n\n"
-                "For complex tasks, I'll work in the background and keep you updated!\n"
-                "Just mention me with your request!"
+                "Hello! I'm **Strix**, your AI security agent. "
+                "Mention me with your request!\n"
+                "🔒 **Security**: Scans, pentesting, analysis\n"
+                "⚙️ **Discord Admin**: Channels, roles, permissions\n"
+                "🖥️ **Commands**: Execute tools in the container\n"
+                "⏱️ **Long tasks**: I'll work in background and update you"
             )
             return
-        
-        # Check if user has a running task in this channel
+
+        # Check for running task in this channel
         running_task = await self.tasks.get_user_running_task(message.author.id, message.channel.id)
         if running_task:
-            # User is communicating during an active task
             await self._handle_message_during_task(message, content, running_task)
             return
-        
-        # Classify task complexity
+
         complexity = classify_task_complexity(content)
-        logger.info(f"Task complexity classified as: {complexity.value} for message: {content[:50]}...")
-        
-        # Show typing indicator
+        logger.info(f"Complexity: {complexity.value} for: {content[:80]}...")
+
         if self.config.typing_indicator:
             await message.channel.typing()
-        
-        # Check API readiness
+
         if not self.api_ready:
             self.api_ready = await self._check_api_ready()
             if not self.api_ready:
-                await message.channel.send(
-                    "I'm still initializing. Please wait a moment and try again."
-                )
+                await message.channel.send("I'm still initializing. Please wait a moment.")
                 return
-        
-        # Add user message to memory
+
         await self.memory.add_message(
-            message.author.id,
-            message.channel.id,
-            "user",
-            content,
-            username=str(message.author)
+            message.author.id, message.channel.id, "user", content,
+            username=str(message.author),
         )
-        
-        # Handle based on complexity
-        if complexity in [TaskComplexity.COMPLEX, TaskComplexity.LONG_RUNNING]:
+
+        # Route: Discord actions go directly to discord.py API
+        if is_discord_action(content):
+            await self._handle_discord_action(message, content)
+        elif complexity in [TaskComplexity.COMPLEX, TaskComplexity.LONG_RUNNING]:
             await self._handle_long_task(message, content, complexity)
         else:
             await self._handle_simple_task(message, content)
-    
+
+    async def _handle_discord_action(self, message: discord.Message, content: str) -> None:
+        """Handle Discord operations directly via discord.py API."""
+        async with message.channel.typing():
+            # Ask LLM for guidance on parsing the request (but NOT to execute it)
+            guidance_prompt = (
+                f"The user wants to perform a Discord server action: '{content}'\n"
+                "Extract the key details (names, targets, parameters) and respond with "
+                "ONLY a brief JSON-like summary. Do NOT try to execute anything.\n"
+                "Example: For 'create a channel called security-alerts', respond: "
+                '{"action": "create_channel", "name": "security-alerts"}'
+            )
+            guidance = await self.llm.generate(
+                [{"role": "user", "content": guidance_prompt}],
+                temperature=0.3, max_tokens=200,
+            )
+
+            # Execute the Discord action directly
+            result = await self.discord_ops.execute_discord_action(message, content, guidance)
+
+            await self.memory.add_message(
+                message.author.id, message.channel.id, "assistant", result,
+            )
+            await self._send_response(message.channel, result)
+
     async def _handle_simple_task(self, message: discord.Message, content: str) -> None:
-        """Handle simple/moderate complexity tasks with quick LLM response."""
-        # Get conversation history
+        """Handle simple tasks with quick LLM response."""
         history = await self.memory.get_history(message.author.id, message.channel.id)
-        
-        # Build context with Discord info
-        discord_context = self._build_discord_context(message)
-        enhanced_content = f"{discord_context}\n\nUser Message: {content}"
-        
-        # Update the last message with context
+
+        # Build server context (minimal, not the full dump)
+        guild = message.guild
+        server_info = ""
+        if guild:
+            server_info = (
+                f"\n[Server: {guild.name}, Channel: #{message.channel.name}, "
+                f"User: {message.author.display_name}]"
+            )
+
+        enhanced = f"{server_info}\n\nUser: {content}"
         if history:
-            history[-1]['content'] = enhanced_content
+            history[-1]['content'] = enhanced
         else:
-            history = [{"role": "user", "content": enhanced_content}]
-        
-        # Generate response
+            history = [{"role": "user", "content": enhanced}]
+
         try:
             response = await self.llm.generate(history)
-            
-            # Add assistant response to memory
             await self.memory.add_message(
-                message.author.id,
-                message.channel.id,
-                "assistant",
-                response
+                message.author.id, message.channel.id, "assistant", response,
             )
-            
-            # Send response (handle long messages)
             await self._send_response(message.channel, response, message.author)
-            
         except Exception as e:
-            logger.error(f"Error generating response: {e}")
-            await message.channel.send(
-                f"I encountered an error while processing your request: {str(e)}"
-            )
-    
-    async def _handle_long_task(
-        self, 
-        message: discord.Message, 
-        content: str,
-        complexity: TaskComplexity
-    ) -> None:
-        """Handle complex/long-running tasks with background execution."""
-        # Create task
+            logger.error(f"Error: {e}")
+            await message.channel.send("I encountered an error. Please try again.")
+
+    async def _handle_long_task(self, message: discord.Message, content: str,
+                                complexity: TaskComplexity) -> None:
+        """Handle complex/long-running tasks with background execution (MoltBot-inspired)."""
         task = await self.tasks.create_task(
-            message.author.id,
-            message.channel.id,
-            content,
-            complexity
+            message.author.id, message.channel.id, content, complexity,
         )
-        
-        # Notify user that the task is starting
+
+        # MoltBot-inspired: Ask the user about preference if it's truly long
+        complexity_label = "complex" if complexity == TaskComplexity.COMPLEX else "long-running"
+
         embed = discord.Embed(
-            title="🔄 Long-Running Task Started",
-            description=f"I'm starting a {complexity.value} task. This may take a while.",
-            color=discord.Color.blue()
+            title=f"🔄 {complexity_label.title()} Task Started",
+            description="I'm working on this in the background.",
+            color=discord.Color.blue(),
         )
         embed.add_field(name="Task ID", value=f"`{task.id}`", inline=True)
-        embed.add_field(name="Complexity", value=complexity.value.title(), inline=True)
+        embed.add_field(name="Type", value=complexity_label.title(), inline=True)
         embed.add_field(
             name="What to Expect",
-            value="• I'll work in the background\n"
-                  "• Progress updates will be sent periodically\n"
-                  "• You can still send me messages (I'll see them)\n"
-                  "• Use `!cancel` to stop the task if needed",
-            inline=False
+            value="• Working in the background\n"
+                  "• Progress updates sent periodically\n"
+                  "• You can still message me\n"
+                  "• Use `!cancel` to stop",
+            inline=False,
         )
         embed.add_field(
-            name="Task Description",
-            value=content[:500] + ("..." if len(content) > 500 else ""),
-            inline=False
+            name="Task",
+            value=content[:400] + ("..." if len(content) > 400 else ""),
+            inline=False,
         )
-        status_message = await message.channel.send(embed=embed)
-        
-        # Start the long task in the background
+        await message.channel.send(embed=embed)
+
         async def run_long_task():
             try:
                 await self.tasks.start_task(task.id)
-                
-                # Get conversation history
                 history = await self.memory.get_history(message.author.id, message.channel.id)
-                
-                # Build context with Discord info
-                discord_context = self._build_discord_context(message)
-                
-                # Progress callback
-                async def progress_callback(update: str):
-                    try:
-                        await self.tasks.update_progress(task.id, 0.5, update)
-                        progress_embed = discord.Embed(
-                            title="📊 Task Progress Update",
-                            description=update[:2000],
-                            color=discord.Color.blue()
-                        )
-                        progress_embed.add_field(name="Task ID", value=f"`{task.id}`", inline=True)
-                        await message.channel.send(embed=progress_embed)
-                    except Exception as e:
-                        logger.error(f"Error sending progress update: {e}")
-                
-                # Generate long task response
-                response = await self.llm.generate_long_task_response(
-                    history,
-                    content,
-                    progress_callback
+
+                # Build enhanced prompt for long task
+                guild = message.guild
+                server_info = f"[Server: {guild.name}]" if guild else ""
+
+                system_prompt = STRIX_LONG_TASK_SYSTEM_PROMPT.format(
+                    base_prompt=STRIX_SYSTEM_PROMPT,
                 )
-                
-                # Check for any messages received during task
+
+                task_prompt = (
+                    f"{server_info}\n\n"
+                    f"Execute this task thoroughly: {content}\n\n"
+                    "Remember: Report only RESULTS. Never show commands or reasoning."
+                )
+
+                enhanced_messages = history[:-1] + [{"role": "user", "content": task_prompt}] \
+                    if history else [{"role": "user", "content": task_prompt}]
+
+                # Execute with longer timeout
+                response = await self.llm.generate(
+                    enhanced_messages,
+                    system_prompt=system_prompt,
+                    max_tokens=8000,
+                    timeout=self.config.long_task_timeout,
+                )
+
+                # MoltBot-inspired: mid-task re-evaluation
+                elapsed = (datetime.now(UTC) - task.start_time).total_seconds()
+                if elapsed > 60 and task.complexity == TaskComplexity.COMPLEX:
+                    await self.tasks.re_evaluate_complexity(task.id, TaskComplexity.LONG_RUNNING)
+
+                # Check for messages received during task
                 current_task = await self.tasks.get_task(task.id)
+                pending_msgs = ""
                 if current_task and current_task.messages_during_task:
-                    response += f"\n\n---\n**Messages received during task:**\n"
+                    pending_msgs = "\n\n---\n📝 **Messages received during task:**\n"
                     for msg in current_task.messages_during_task:
-                        response += f"• {msg}\n"
-                    response += "\nI've noted these messages. Let me know if you need me to address any of them."
-                
-                # Complete the task
+                        pending_msgs += f"• **{msg['author']}**: {msg['message']}\n"
+                    pending_msgs += "\nI'll address these next."
+
                 await self.tasks.complete_task(task.id, response)
-                
-                # Add to memory
                 await self.memory.add_message(
-                    message.author.id,
-                    message.channel.id,
-                    "assistant",
-                    response,
-                    task_id=task.id
+                    message.author.id, message.channel.id, "assistant",
+                    response, task_id=task.id,
                 )
-                
-                # Send completion notification
+
+                # Send completion
+                duration = datetime.now(UTC) - task.start_time
+                dur_str = f"{duration.total_seconds():.0f}s"
+                if duration.total_seconds() > 60:
+                    dur_str = f"{duration.total_seconds() / 60:.1f} min"
+
                 completion_embed = discord.Embed(
                     title="✅ Task Completed",
-                    description=f"Task `{task.id}` has finished.",
-                    color=discord.Color.green()
-                )
-                duration = datetime.now(UTC) - task.start_time
-                completion_embed.add_field(
-                    name="Duration", 
-                    value=f"{duration.total_seconds():.1f} seconds",
-                    inline=True
+                    description=f"Task `{task.id}` finished in {dur_str}.",
+                    color=discord.Color.green(),
                 )
                 await message.channel.send(embed=completion_embed)
-                
-                # Send the response
-                await self._send_response(message.channel, response, message.author)
-                
+                await self._send_response(message.channel, response + pending_msgs, message.author)
+
             except asyncio.CancelledError:
                 await self.tasks.cancel_task(task.id)
-                await message.channel.send(
-                    f"Task `{task.id}` was cancelled."
-                )
+                await message.channel.send(f"Task `{task.id}` was cancelled.")
             except Exception as e:
-                logger.error(f"Error in long task {task.id}: {e}")
+                logger.error(f"Long task {task.id} error: {e}")
                 await self.tasks.fail_task(task.id, str(e))
-                await message.channel.send(
-                    f"❌ Task `{task.id}` failed: {str(e)}"
-                )
-        
-        # Create and store the asyncio task
+                await message.channel.send(f"❌ Task `{task.id}` failed: {e}")
+
         asyncio_task = asyncio.create_task(run_long_task())
         task._asyncio_task = asyncio_task
-    
-    async def _handle_message_during_task(
-        self, 
-        message: discord.Message, 
-        content: str,
-        task: Task
-    ) -> None:
-        """Handle a message received while a task is running."""
-        # Add the message to the task's queue
-        await self.tasks.add_message_during_task(task.id, content)
-        
-        # Acknowledge receipt
-        await message.channel.send(
-            f"📝 I received your message while working on task `{task.id}`.\n"
-            f"I'll address it when the current task completes, or you can use `!cancel` to stop the task.\n"
-            f"Your message: *{content[:100]}{'...' if len(content) > 100 else ''}*"
+
+    async def _handle_message_during_task(self, message: discord.Message, content: str,
+                                           task: Task) -> None:
+        """MoltBot-inspired: handle messages during active tasks without disruption."""
+        await self.tasks.add_message_during_task(
+            task.id, message.author.display_name, content,
         )
-    
-    def _build_discord_context(self, message: discord.Message) -> str:
-        """Build context about the Discord environment for the LLM."""
-        guild = message.guild
-        if not guild:
-            return ""
-        
-        permissions = guild.me.guild_permissions
-        
-        context = f"""
-<discord_context>
-Server: {guild.name} (ID: {guild.id})
-Channel: #{message.channel.name} (ID: {message.channel.id})
-User: {message.author.name} (ID: {message.author.id})
 
-Bot Permissions:
-- Administrator: {permissions.administrator}
-- Manage Channels: {permissions.manage_channels}
-- Manage Roles: {permissions.manage_roles}
-- Manage Messages: {permissions.manage_messages}
-- Kick Members: {permissions.kick_members}
-- Ban Members: {permissions.ban_members}
-- Manage Guild: {permissions.manage_guild}
+        # Quick acknowledgment without interrupting the task
+        duration = datetime.now(UTC) - task.start_time
+        dur_str = f"{duration.total_seconds():.0f}s"
 
-Available Channels: {len(guild.channels)}
-Available Roles: {len(guild.roles)}
-Member Count: {guild.member_count}
+        await message.channel.send(
+            f"📝 Got your message! I'm still working on task `{task.id}` "
+            f"(running for {dur_str}). I'll address your message when done.\n"
+            f"Use `!cancel` to stop the current task.",
+        )
 
-IMPORTANT: You have full admin access. When asked to create channels, roles, or perform other admin actions, you MUST execute them using the Discord API methods available to you.
-</discord_context>
-"""
-        return context
-    
-    async def _send_response(
-        self, 
-        channel: discord.TextChannel, 
-        content: str,
-        author: Optional[discord.User] = None
-    ) -> None:
-        """Send a response, splitting if necessary."""
-        # Split content into chunks if too long
+    async def _send_response(self, channel: discord.TextChannel, content: str,
+                              author: Optional[discord.User] = None) -> None:
         max_len = self.config.max_message_length
-        
         if len(content) <= max_len:
             await channel.send(content)
             return
-        
-        # Split on code blocks first, then paragraphs, then arbitrary
+
         chunks = self._split_content(content, max_len)
-        
         for i, chunk in enumerate(chunks):
-            if i == 0:
-                await channel.send(chunk)
-            else:
-                await asyncio.sleep(0.5)  # Rate limit protection
-                await channel.send(chunk)
-    
+            if i > 0:
+                await asyncio.sleep(0.5)
+            await channel.send(chunk)
+
     def _split_content(self, content: str, max_len: int) -> list[str]:
-        """Split content into chunks respecting code blocks."""
         chunks = []
         current = ""
-        
-        # Try to split on code blocks
         parts = re.split(r'(```[\s\S]*?```)', content)
-        
+
         for part in parts:
             if len(current) + len(part) <= max_len:
                 current += part
             else:
                 if current:
                     chunks.append(current.strip())
-                
-                # If the part itself is too long, split it
                 if len(part) > max_len:
-                    # Split on newlines
                     lines = part.split('\n')
                     current = ""
                     for line in lines:
@@ -1369,237 +1649,170 @@ IMPORTANT: You have full admin access. When asked to create channels, roles, or 
                         else:
                             if current:
                                 chunks.append(current.strip())
-                            # If single line is too long, force split
                             if len(line) > max_len:
                                 for j in range(0, len(line), max_len):
-                                    chunks.append(line[j:j+max_len])
+                                    chunks.append(line[j:j + max_len])
                                 current = ""
                             else:
                                 current = line + '\n'
                 else:
                     current = part
-        
+
         if current.strip():
             chunks.append(current.strip())
-        
+
         return chunks if chunks else [content[:max_len]]
-    
+
     # ========================================================================
     # Commands
     # ========================================================================
-    
+
     @commands.command(name='help')
     async def cmd_help(self, ctx: commands.Context) -> None:
-        """Show help information."""
         embed = discord.Embed(
             title="🦉 Strix Security Agent - Help",
-            description="I'm an AI-powered security agent with **full Discord admin privileges**. I can help with penetration testing, vulnerability assessment, security analysis, AND server management.",
-            color=discord.Color.blue()
+            description="AI security agent with full Discord admin privileges.",
+            color=discord.Color.blue(),
         )
-        
         embed.add_field(
-            name="🔒 Security Capabilities",
-            value="• Vulnerability scanning and assessment\n"
-                  "• Penetration testing\n"
-                  "• Code analysis and review\n"
-                  "• Web fuzzing and enumeration\n"
-                  "• Execute terminal commands and scripts",
-            inline=False
+            name="🔒 Security",
+            value="• Vulnerability scanning\n• Penetration testing\n• Code analysis\n• Web fuzzing",
+            inline=False,
         )
-        
         embed.add_field(
-            name="⚙️ Discord Admin Powers",
-            value="• Create/delete channels and categories\n"
-                  "• Create/manage roles and permissions\n"
-                  "• Kick/ban/timeout users\n"
-                  "• Bulk delete messages\n"
-                  "• Modify server settings",
-            inline=False
+            name="⚙️ Discord Admin",
+            value="• Create/delete channels & categories\n• Create/manage roles\n"
+                  "• Kick/ban/timeout users\n• List members, roles, channels",
+            inline=False,
         )
-        
         embed.add_field(
-            name="💬 How to Interact",
-            value="Simply mention me with your request:\n"
-                  "`@Strix scan example.com for vulnerabilities`\n"
-                  "`@Strix create a channel called #security-alerts`\n"
-                  "`@Strix create a role called Admin with red color`",
-            inline=False
+            name="🖥️ Container",
+            value="• Execute shell commands\n• Run security tools\n• Python scripting",
+            inline=False,
         )
-        
+        embed.add_field(
+            name="💬 Usage",
+            value="Mention me: `@Strix <request>`\n"
+                  "Examples:\n"
+                  "• `@Strix create a channel called alerts`\n"
+                  "• `@Strix list all roles`\n"
+                  "• `@Strix scan example.com`",
+            inline=False,
+        )
         embed.add_field(
             name="📋 Commands",
-            value=(
-                "`!help` - Show this help message\n"
-                "`!status` - Check bot and API status\n"
-                "`!clear` - Clear conversation history\n"
-                "`!tasks` - Show your active tasks\n"
-                "`!cancel` - Cancel a running task"
-            ),
-            inline=False
+            value="`!help` `!status` `!clear` `!tasks` `!cancel`",
+            inline=False,
         )
-        
-        embed.add_field(
-            name="⏱️ Long-Running Tasks",
-            value="For complex scans (deep vulnerability assessments, comprehensive pentests), "
-                  "I'll work in the background and send progress updates. You can still chat with me during these tasks!",
-            inline=False
-        )
-        
-        embed.set_footer(text="Strix by OmniSecure Labs | Full Admin Mode Active")
         await ctx.send(embed=embed)
-    
+
     @commands.command(name='status')
     async def cmd_status(self, ctx: commands.Context) -> None:
-        """Show bot status."""
-        # Re-check API status
         self.api_ready = await self._check_api_ready()
-        
         guild = ctx.guild
-        permissions = guild.me.guild_permissions if guild else None
-        
+        perms = guild.me.guild_permissions if guild else None
+
         embed = discord.Embed(
             title="🦉 Strix Status",
-            color=discord.Color.green() if self.api_ready else discord.Color.orange()
+            color=discord.Color.green() if self.api_ready else discord.Color.orange(),
         )
-        
-        embed.add_field(name="Bot Status", value="✅ Online", inline=True)
-        embed.add_field(name="API Status", value="✅ Ready" if self.api_ready else "❌ Not Ready", inline=True)
+        embed.add_field(name="Bot", value="✅ Online", inline=True)
+        embed.add_field(name="API", value="✅ Ready" if self.api_ready else "❌ Not Ready", inline=True)
         embed.add_field(name="Model", value=self.config.cliproxy_model, inline=True)
-        
-        if permissions:
-            admin_status = "✅ Full Admin" if permissions.administrator else "⚠️ Limited"
-            embed.add_field(name="Admin Status", value=admin_status, inline=True)
-        
-        active_tasks = await self.tasks.get_active_tasks(ctx.author.id)
-        embed.add_field(name="Your Active Tasks", value=str(len(active_tasks)), inline=True)
-        
-        embed.add_field(name="Endpoint", value=self.config.cliproxy_endpoint or "Not configured", inline=False)
-        
-        # Show permission details
-        if permissions:
-            perm_list = []
-            if permissions.administrator:
-                perm_list.append("✅ Administrator")
-            if permissions.manage_channels:
-                perm_list.append("✅ Manage Channels")
-            if permissions.manage_roles:
-                perm_list.append("✅ Manage Roles")
-            if permissions.manage_messages:
-                perm_list.append("✅ Manage Messages")
-            if permissions.kick_members:
-                perm_list.append("✅ Kick Members")
-            if permissions.ban_members:
-                perm_list.append("✅ Ban Members")
-            
+
+        if perms:
             embed.add_field(
                 name="Permissions",
-                value="\n".join(perm_list) if perm_list else "No special permissions",
-                inline=False
+                value=f"Admin: {'✅' if perms.administrator else '❌'}\n"
+                      f"Channels: {'✅' if perms.manage_channels else '❌'}\n"
+                      f"Roles: {'✅' if perms.manage_roles else '❌'}\n"
+                      f"Messages: {'✅' if perms.manage_messages else '❌'}",
+                inline=True,
             )
-        
+
+        if guild:
+            embed.add_field(name="Members", value=str(guild.member_count), inline=True)
+
+        active = await self.tasks.get_active_tasks(ctx.author.id)
+        embed.add_field(name="Your Tasks", value=str(len(active)), inline=True)
         await ctx.send(embed=embed)
-    
+
     @commands.command(name='clear')
     async def cmd_clear(self, ctx: commands.Context) -> None:
-        """Clear conversation history."""
         if await self.memory.clear(ctx.author.id, ctx.channel.id):
             await ctx.send("✅ Conversation history cleared.")
         else:
-            await ctx.send("No conversation history to clear.")
-    
+            await ctx.send("No history to clear.")
+
     @commands.command(name='tasks')
     async def cmd_tasks(self, ctx: commands.Context) -> None:
-        """Show active tasks."""
-        active_tasks = await self.tasks.get_active_tasks(ctx.author.id)
-        
-        if not active_tasks:
+        active = await self.tasks.get_active_tasks(ctx.author.id)
+        if not active:
             await ctx.send("You have no active tasks.")
             return
-        
-        embed = discord.Embed(
-            title="📋 Your Active Tasks",
-            color=discord.Color.blue()
-        )
-        
-        for task in active_tasks:
-            duration = datetime.now(UTC) - task.start_time
-            progress_bar = self._make_progress_bar(task.progress)
-            
+
+        embed = discord.Embed(title="📋 Active Tasks", color=discord.Color.blue())
+        for t in active:
+            duration = datetime.now(UTC) - t.start_time
+            bar = self._progress_bar(t.progress)
             embed.add_field(
-                name=f"Task `{task.id}`",
-                value=f"**Description:** {task.description[:100]}{'...' if len(task.description) > 100 else ''}\n"
-                      f"**Complexity:** {task.complexity.value.title()}\n"
-                      f"**Progress:** {progress_bar} {task.progress*100:.0f}%\n"
-                      f"**Current Step:** {task.current_step or 'Processing...'}\n"
-                      f"**Running for:** {duration.total_seconds():.0f}s",
-                inline=False
+                name=f"Task `{t.id}`",
+                value=f"**Desc:** {t.description[:80]}...\n"
+                      f"**Progress:** {bar} {t.progress * 100:.0f}%\n"
+                      f"**Step:** {t.current_step or 'Processing...'}\n"
+                      f"**Running:** {duration.total_seconds():.0f}s",
+                inline=False,
             )
-        
-        embed.set_footer(text="Use !cancel to stop a task")
         await ctx.send(embed=embed)
-    
+
     @commands.command(name='cancel')
     async def cmd_cancel(self, ctx: commands.Context, task_id: Optional[str] = None) -> None:
-        """Cancel a running task."""
-        active_tasks = await self.tasks.get_active_tasks(ctx.author.id)
-        
-        if not active_tasks:
-            await ctx.send("You have no active tasks to cancel.")
+        active = await self.tasks.get_active_tasks(ctx.author.id)
+        if not active:
+            await ctx.send("No active tasks to cancel.")
             return
-        
+
         if task_id:
-            # Cancel specific task
             if await self.tasks.cancel_task(task_id):
-                await ctx.send(f"✅ Task `{task_id}` has been cancelled.")
+                await ctx.send(f"✅ Task `{task_id}` cancelled.")
             else:
-                await ctx.send(f"❌ Could not cancel task `{task_id}`. It may not exist or may have already completed.")
+                await ctx.send(f"❌ Could not cancel `{task_id}`.")
+        elif len(active) == 1:
+            if await self.tasks.cancel_task(active[0].id):
+                await ctx.send(f"✅ Task `{active[0].id}` cancelled.")
         else:
-            # If only one task, cancel it
-            if len(active_tasks) == 1:
-                task = active_tasks[0]
-                if await self.tasks.cancel_task(task.id):
-                    await ctx.send(f"✅ Task `{task.id}` has been cancelled.")
-                else:
-                    await ctx.send(f"❌ Could not cancel the task.")
-            else:
-                # Multiple tasks, ask user to specify
-                task_list = "\n".join([f"• `{t.id}` - {t.description[:50]}..." for t in active_tasks])
-                await ctx.send(f"You have multiple active tasks. Please specify which one to cancel:\n{task_list}\n\nUsage: `!cancel <task_id>`")
-    
-    def _make_progress_bar(self, progress: float, length: int = 10) -> str:
-        """Create a text-based progress bar."""
+            task_list = "\n".join([f"• `{t.id}` - {t.description[:50]}..." for t in active])
+            await ctx.send(f"Multiple tasks running:\n{task_list}\n\nUse: `!cancel <task_id>`")
+
+    def _progress_bar(self, progress: float, length: int = 10) -> str:
         filled = int(progress * length)
-        empty = length - filled
-        return f"[{'█' * filled}{'░' * empty}]"
-    
+        return f"[{'█' * filled}{'░' * (length - filled)}]"
+
     async def close(self) -> None:
-        """Clean up resources."""
         await self.llm.close()
         await super().close()
 
 
 # ============================================================================
-# Main Entry Point
+# Main
 # ============================================================================
 
 def main():
-    """Main entry point."""
     config = BotConfig.from_env()
-    
+
     if not config.discord_token:
-        logger.error("DISCORD_BOT_TOKEN environment variable not set")
+        logger.error("DISCORD_BOT_TOKEN not set")
         return
-    
+
     if not config.cliproxy_endpoint:
-        logger.warning("CLIPROXY_ENDPOINT not set - API calls may fail")
-    
+        logger.warning("CLIPROXY_ENDPOINT not set")
+
     logger.info(f"Starting Strix Discord Bot")
     logger.info(f"Model: {config.cliproxy_model}")
     logger.info(f"Endpoint: {config.cliproxy_endpoint}")
-    logger.info(f"Long Task Timeout: {config.long_task_timeout}s")
-    
+
     bot = StrixBot(config)
-    
+
     try:
         bot.run(config.discord_token)
     except KeyboardInterrupt:
