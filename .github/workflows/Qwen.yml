@@ -14,6 +14,10 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   collect-tokens:
     runs-on: ubuntu-latest
@@ -356,12 +360,20 @@ jobs:
         env:
           SERVER_TOKEN_SECRET: ${{ secrets.SERVER_TOKEN }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           echo "::group::Updating QWEN_TOKENS secret"
 
           if [ -z "$SERVER_TOKEN_SECRET" ]; then
             echo "::warning::SERVER_TOKEN secret not set. Cannot update secret automatically."
-            echo "Please manually set QWEN_TOKENS secret using the artifact below."
+            echo ""
+            echo "To enable automatic secret updates, create a Personal Access Token:"
+            echo "  1. Go to https://github.com/settings/tokens"
+            echo "  2. Click 'Generate new token (classic)'"
+            echo "  3. Select 'repo' scope (for private repos) or 'public_repo' (for public repos)"
+            echo "  4. Generate and copy the token"
+            echo "  5. Add it as SERVER_TOKEN secret in your repository settings"
+            echo ""
+            echo "For now, please manually set QWEN_TOKENS secret using the artifact below."
             echo "::endgroup::"
             exit 0
           fi
@@ -377,15 +389,36 @@ jobs:
           }
 
           echo "Updating secret..."
+          set +e
           python3 -m strix.runtime.remote_tool_server.update_secret \
             "$SERVER_TOKEN_SECRET" \
             "${{ github.repository_owner }}" \
             "$REPO_NAME" \
             "QWEN_TOKENS" \
-            "$BASE64_SECRET" || {
-              echo "::error::Secret update script failed with exit code $?"
-              exit 1
-            }
+            "$BASE64_SECRET"
+          UPDATE_EXIT_CODE=$?
+          set -e
+
+          if [ $UPDATE_EXIT_CODE -ne 0 ]; then
+            echo ""
+            echo "::warning::Failed to automatically update QWEN_TOKENS secret (exit code: $UPDATE_EXIT_CODE)"
+            echo ""
+            echo "This usually means your SERVER_TOKEN doesn't have the required permissions."
+            echo ""
+            echo "To fix this issue:"
+            echo "  1. Go to https://github.com/settings/tokens"
+            echo "  2. Create a new Personal Access Token (classic) with these scopes:"
+            echo "     - 'repo' (if your repository is private) OR"
+            echo "     - 'public_repo' (if your repository is public)"
+            echo "  3. Copy the generated token"
+            echo "  4. Go to your repository → Settings → Secrets and variables → Actions"
+            echo "  5. Update the SERVER_TOKEN secret with your new token"
+            echo ""
+            echo "For now, you can manually set QWEN_TOKENS using the artifact below."
+            echo "::endgroup::"
+            # Don't fail the workflow - artifact is still available for manual setup
+            exit 0
+          fi
 
           echo "✓ Secret 'QWEN_TOKENS' updated successfully"
           echo "::endgroup::"
