@@ -53,20 +53,51 @@ jobs:
 
       - name: Decrypt Qwen Tokens
         id: decrypt
+        env:
+          QWEN_TOKENS: ${{ secrets.QWEN_TOKENS }}
         run: |
           set -euo pipefail
           echo "::group::Decrypting Qwen tokens"
-          if [ -z "${{ secrets.QWEN_TOKENS }}" ]; then
+          if [ -z "$QWEN_TOKENS" ]; then
             echo "::error::QWEN_TOKENS secret is not set"
             exit 1
           fi
           mkdir -p ~/.cli-proxy-api
           cd ~/.cli-proxy-api
-          echo "${{ secrets.QWEN_TOKENS }}" | base64 -d > qwen-tokens.enc
+
+          # Trim whitespace/newlines and decode base64
+          # Use printf to avoid echo adding newlines, and tr to remove any whitespace
+          CLEAN_TOKEN=$(printf '%s' "$QWEN_TOKENS" | tr -d '[:space:]')
+
+          # Debug: Show token length (not the token itself)
+          echo "Token length after cleaning: ${#CLEAN_TOKEN} characters"
+
+          # Decode base64
+          if ! printf '%s' "$CLEAN_TOKEN" | base64 -d > qwen-tokens.enc 2>/dev/null; then
+            echo "::error::Failed to decode base64. The QWEN_TOKENS secret may be corrupted or contain invalid characters."
+            echo "::error::Please re-run Qwen.yml workflow to regenerate the tokens."
+            exit 1
+          fi
+
+          # Verify the encrypted file was created and has content
+          if [ ! -s qwen-tokens.enc ]; then
+            echo "::error::Decoded file is empty. The QWEN_TOKENS secret may be empty or invalid."
+            exit 1
+          fi
+
+          echo "Encrypted file size: $(stat -c%s qwen-tokens.enc 2>/dev/null || stat -f%z qwen-tokens.enc 2>/dev/null) bytes"
+
           if ! echo "${{ github.event.inputs.decryption_password }}" | openssl enc -aes-256-cbc -d -salt -pbkdf2 -in qwen-tokens.enc -out qwen-tokens.tar.gz -pass stdin 2>/dev/null; then
             echo "::error::Failed to decrypt tokens. Invalid password"
             exit 1
           fi
+
+          # Verify tarball is valid
+          if ! tar -tzf qwen-tokens.tar.gz > /dev/null 2>&1; then
+            echo "::error::Decrypted archive is corrupted or invalid"
+            exit 1
+          fi
+
           tar -xzf qwen-tokens.tar.gz
           TOKEN_COUNT=$(find . -maxdepth 1 -name 'qwen-*.json' | wc -l)
           echo "Successfully decrypted $TOKEN_COUNT Qwen account(s)"
