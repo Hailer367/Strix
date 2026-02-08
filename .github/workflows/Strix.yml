@@ -22,7 +22,7 @@ on:
 
 env:
   CLIPROXY_PORT: '8317'
-  STRIX_IMAGE: ghcr.io/hailer367/strix/strix-sandbox:latest
+  STRIX_IMAGE: ghcr.io/hailer367/strix/hailer367/strix-sandbox:latest
 
 jobs:
   strix-runtime:
@@ -30,6 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      packages: read
       security-events: write
 
     steps:
@@ -180,6 +181,13 @@ jobs:
           ENDPOINT="http://127.0.0.1:${{ env.CLIPROXY_PORT }}/v1"
           echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
           echo "::endgroup::"
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull Strix Sandbox Image
         run: |
